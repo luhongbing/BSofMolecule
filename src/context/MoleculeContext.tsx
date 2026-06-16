@@ -413,6 +413,25 @@ function moleculeReducer(state: MoleculeState, action: MoleculeAction): Molecule
    atom2Id: idxToId.get(gb.atom2Idx) || null,
    order: gb.order,
  }));
+ // 创建空头键（官能团中未连接的可用键位）
+ if (group.emptyBonds && group.emptyBonds.length > 0) {
+   group.emptyBonds.forEach(eb => {
+     const attachedAtomId = idxToId.get(eb.atomIdx);
+     if (attachedAtomId) {
+       newBonds.push({
+         id: generateUUID(),
+         atom1Id: attachedAtomId,
+         atom2Id: null,
+         order: eb.order,
+         atom2Position: {
+           x: basePos.x + eb.position.x,
+           y: basePos.y + eb.position.y,
+           z: basePos.z + eb.position.z,
+         },
+       });
+     }
+   });
+ }
  const allAtoms = [...state.molecule.atoms, ...newAtoms];
  const allBonds = [...state.molecule.bonds, ...newBonds];
  const newMolecule = updateMoleculeProperties({ ...state.molecule, atoms: allAtoms, bonds: allBonds });
