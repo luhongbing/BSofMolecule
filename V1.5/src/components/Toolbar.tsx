@@ -38,6 +38,7 @@ export function Toolbar() {
   const [searchSmiles, setSearchSmiles] = useState('');
   const [showAllAtoms, setShowAllAtoms] = useState(false);
   const [atomSearch, setAtomSearch] = useState('');
+  const [highlightedIndex, setHighlightedIndex] = useState(0);
   const dropdownRef = useRef<HTMLDivElement>(null);
   const atomDropdownRef = useRef<HTMLDivElement>(null);
 
@@ -82,6 +83,46 @@ export function Toolbar() {
         g.category.includes(atomSearch)
       )
     : FUNCTIONAL_GROUPS;
+
+  // 构建扁平化的搜索结果列表（原子 + 官能团），用于高亮和回车选择
+  type AtomItem = { type: 'atom'; data: typeof ALL_ATOMS[0] };
+  type GroupItem = { type: 'group'; data: typeof FUNCTIONAL_GROUPS[0] };
+  const searchResults: (AtomItem | GroupItem)[] = [
+    ...filteredAllAtoms.map(a => ({ type: 'atom' as const, data: a })),
+    ...filteredFunctionalGroups.map(g => ({ type: 'group' as const, data: g })),
+  ];
+
+  // 搜索内容变化时重置高亮到第一项
+  const handleAtomSearchChange = (value: string) => {
+    setAtomSearch(value);
+    setHighlightedIndex(0);
+  };
+
+  // 回车选中高亮项
+  const handleAtomSearchKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      setHighlightedIndex(prev => Math.min(prev + 1, searchResults.length - 1));
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      setHighlightedIndex(prev => Math.max(prev - 1, 0));
+    } else if (e.key === 'Enter') {
+      e.preventDefault();
+      const item = searchResults[highlightedIndex];
+      if (item) {
+        if (item.type === 'atom') {
+          startDragAtom(item.data.symbol);
+        } else {
+          setInsertFunctionalGroup(item.data.id);
+        }
+        setShowAllAtoms(false);
+        setAtomSearch('');
+      }
+    } else if (e.key === 'Escape') {
+      setShowAllAtoms(false);
+      setAtomSearch('');
+    }
+  };
 
   const handlePresetSelect = (nameOrSmiles: string) => {
     // 首先查找是否有预定义的分子创建函数（通过名称）
@@ -912,75 +953,82 @@ export function Toolbar() {
                       <input
                         type="text"
                         value={atomSearch}
-                        onChange={(e) => setAtomSearch(e.target.value)}
+                        onChange={(e) => handleAtomSearchChange(e.target.value)}
+                        onKeyDown={handleAtomSearchKeyDown}
                         placeholder="搜索元素或官能团..."
                         className="w-full px-2 py-1 bg-gray-700 rounded text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
                         autoFocus
                       />
                     </div>
                     <div className="max-h-72 overflow-y-auto p-1">
-                      {filteredAllAtoms.map((atom) => (
-                        <button
-                          key={atom.symbol}
-                          draggable
-                          onDragStart={(e) => {
-                            e.dataTransfer.setData('atom', atom.symbol);
-                            startDragAtom(atom.symbol);
-                          }}
-                          onClick={() => {
-                            startDragAtom(atom.symbol);
-                            setShowAllAtoms(false);
-                            setAtomSearch('');
-                          }}
-                          className="w-full px-2 py-1.5 text-left hover:bg-gray-700 rounded transition-colors flex items-center gap-2"
-                        >
-                          <span
-                            className="w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0"
-                            style={{ backgroundColor: atom.color, color: atom.color === '#FFFFFF' || atom.color === '#FFFF30' ? '#000' : '#FFF' }}
-                          >
-                            {atom.symbol.length > 2 ? atom.symbol.slice(0, 2) : atom.symbol}
-                          </span>
-                          <span className="text-sm">{atom.name}</span>
-                          <span className="text-xs text-gray-500 ml-auto">{atom.symbol}</span>
-                        </button>
-                      ))}
-
-                      {/* 官能团分类列表 */}
-                      {filteredFunctionalGroups.length > 0 && (
-                        <>
-                          <div className="border-t border-gray-600 my-1"></div>
-                          {FUNCTIONAL_GROUP_CATEGORIES.map(category => {
-                            const groups = filteredFunctionalGroups.filter(g => g.category === category);
-                            if (groups.length === 0) return null;
-                            return (
-                              <div key={category}>
+                      {searchResults.map((item, globalIndex) => {
+                        const isHighlighted = globalIndex === highlightedIndex;
+                        if (item.type === 'atom') {
+                          const atom = item.data;
+                          return (
+                            <button
+                              key={atom.symbol}
+                              draggable
+                              onDragStart={(e) => {
+                                e.dataTransfer.setData('atom', atom.symbol);
+                                startDragAtom(atom.symbol);
+                              }}
+                              onClick={() => {
+                                startDragAtom(atom.symbol);
+                                setShowAllAtoms(false);
+                                setAtomSearch('');
+                              }}
+                              onMouseEnter={() => setHighlightedIndex(globalIndex)}
+                              className={`w-full px-2 py-1.5 text-left rounded transition-colors flex items-center gap-2 ${
+                                isHighlighted ? 'bg-blue-600/50 ring-1 ring-blue-400' : 'hover:bg-gray-700'
+                              }`}
+                            >
+                              <span
+                                className="w-6 h-6 rounded-full flex items-center justify-center text-[10px] font-bold shrink-0"
+                                style={{ backgroundColor: atom.color, color: atom.color === '#FFFFFF' || atom.color === '#FFFF30' ? '#000' : '#FFF' }}
+                              >
+                                {atom.symbol.length > 2 ? atom.symbol.slice(0, 2) : atom.symbol}
+                              </span>
+                              <span className="text-sm">{atom.name}</span>
+                              <span className="text-xs text-gray-500 ml-auto">{atom.symbol}</span>
+                            </button>
+                          );
+                        } else {
+                          const group = item.data;
+                          // 官能团分类分隔线：如果这是该分类的第一个项，显示分类名
+                          const prevItem = globalIndex > 0 ? searchResults[globalIndex - 1] : null;
+                          const isFirstInCategory = !prevItem || prevItem.type !== 'group' || prevItem.data.category !== group.category;
+                          return (
+                            <div key={group.id}>
+                              {isFirstInCategory && (
+                                <div className="border-t border-gray-600 my-1"></div>
+                              )}
+                              {isFirstInCategory && (
                                 <div className="px-2 py-1 text-xs text-gray-400 font-medium bg-gray-750 sticky top-0">
-                                  {category}
+                                  {group.category}
                                 </div>
-                                {groups.map(group => (
-                                  <button
-                                    key={group.id}
-                                    onClick={() => {
-                                      setInsertFunctionalGroup(group.id);
-                                      setShowAllAtoms(false);
-                                      setAtomSearch('');
-                                    }}
-                                    className={`w-full px-2 py-1.5 text-left hover:bg-gray-700 rounded transition-colors flex items-center gap-2 ${
-                                      state.insertFunctionalGroupId === group.id ? 'bg-blue-900/50 ring-1 ring-blue-400' : ''
-                                    }`}
-                                  >
-                                    <span className="w-6 h-6 rounded flex items-center justify-center text-[10px] font-bold shrink-0 bg-gray-600 text-gray-300">
-                                      {group.formula.slice(0, 2)}
-                                    </span>
-                                    <span className="text-sm">{group.name}</span>
-                                    <span className="text-xs text-gray-500 ml-auto">{group.formula}</span>
-                                  </button>
-                                ))}
-                              </div>
-                            );
-                          })}
-                        </>
-                      )}
+                              )}
+                              <button
+                                onClick={() => {
+                                  setInsertFunctionalGroup(group.id);
+                                  setShowAllAtoms(false);
+                                  setAtomSearch('');
+                                }}
+                                onMouseEnter={() => setHighlightedIndex(globalIndex)}
+                                className={`w-full px-2 py-1.5 text-left rounded transition-colors flex items-center gap-2 ${
+                                  isHighlighted ? 'bg-blue-600/50 ring-1 ring-blue-400' : (state.insertFunctionalGroupId === group.id ? 'bg-blue-900/50 ring-1 ring-blue-400' : 'hover:bg-gray-700')
+                                }`}
+                              >
+                                <span className="w-6 h-6 rounded flex items-center justify-center text-[10px] font-bold shrink-0 bg-gray-600 text-gray-300">
+                                  {group.formula.slice(0, 2)}
+                                </span>
+                                <span className="text-sm">{group.name}</span>
+                                <span className="text-xs text-gray-500 ml-auto">{group.formula}</span>
+                              </button>
+                            </div>
+                          );
+                        }
+                      })}
                     </div>
                   </div>
                 )}

@@ -4,19 +4,19 @@ import { getElementColor, getCovalentRadius, getVdwRadius } from './elements';
 // Re-export from elements library for backward compatibility
 export { getElementColor, getCovalentRadius, getVdwRadius };
 
-// 原子最大成键数（N 规则 / 八电子规则）
-// H=1, C=4, N=3, O=2, 卤素=1, S=2(常见), P=3(常见)
+// 原子最大成键数（按最高化合价设定）
+// H=1, C=4, N=4(如硝基), O=2, 卤素=1, S=6(如硫酸), P=5(如磷酸)
 const MAX_BOND_CAPACITY: Record<string, number> = {
   H: 1,
   C: 4,
-  N: 3,
+  N: 4,
   O: 2,
   F: 1,
   Cl: 1,
   Br: 1,
   I: 1,
-  S: 2,
-  P: 3
+  S: 6,
+  P: 5
 };
 
 // 计算原子已使用的化合价
@@ -320,7 +320,9 @@ export function analyzeHybridization(molecule: Molecule): HybridizationAnalysis 
   const result: HybridizationAnalysis = { sp: [], sp2: [], sp3: [] };
   
   molecule.atoms.forEach(atom => {
-    if (atom.symbol !== 'C' && atom.symbol !== 'O' && atom.symbol !== 'N') return;
+    // 处理所有常见有机分子元素：C, O, N, P, S
+    const supportedSymbols = ['C', 'O', 'N', 'P', 'S'];
+    if (!supportedSymbols.includes(atom.symbol)) return;
     
     // 如果原子已有杂化类型（由SMILES解析器根据芳香性设置），优先使用
     if (atom.hybridization) {
@@ -333,9 +335,19 @@ export function analyzeHybridization(molecule: Molecule): HybridizationAnalysis 
     );
     
     const maxBondOrder = Math.max(...bonds.map(b => b.order));
-    
-    // 有三键→sp，有双键→sp2，否则sp3
-    if (maxBondOrder === 3) {
+    const bondCount = bonds.length;
+
+    // 杂化类型由键数和键级共同决定：
+    // 4键→sp3（四面体，如磷酸酯P、铵盐N）
+    // 3键+双键→sp2（平面三角，如羰基C）
+    // 3键+全单键→sp3（如胺N、甲基C）
+    // 2键+三键→sp（直线，如炔烃C）
+    // 2键+双键→sp2（如烯基C）
+    // 2键+全单键→sp3（如水O）
+    if (bondCount >= 4) {
+      result.sp3.push(atom.id);
+      atom.hybridization = 'sp3';
+    } else if (maxBondOrder === 3) {
       result.sp.push(atom.id);
       atom.hybridization = 'sp';
     } else if (maxBondOrder === 2) {
@@ -1188,10 +1200,38 @@ function getAngle(p1: { x: number; y: number; z: number }, p2: { x: number; y: n
 }
 
 // 获取标准键长
-function getStandardBondLength(symbol1: string, symbol2: string, order: number): number {
+// 键长规则：
+// 1. 空键（两端null）：用C-C键长（1.54Å单键/1.34Å双键/1.20Å三键）
+// 2. 单头键（一端有原子A，一端null）：用A-C键长
+// 3. 双头键（两端都有原子）：用实际原子对的键长
+export function getStandardBondLength(symbol1: string, symbol2: string, order: number): number {
   const key1 = `${symbol1}-${symbol2}`;
   const key2 = `${symbol2}-${symbol1}`;
   return STANDARD_BOND_LENGTHS[key1]?.[order] || STANDARD_BOND_LENGTHS[key2]?.[order] || 1.54;
+}
+
+// 根据键的当前状态计算正确的键长
+// 空键用C-C键长，单头键用原子-C键长，双头键用实际原子对键长
+export function getBondLengthForState(
+  bond: { atom1Id: string | null; atom2Id: string | null; order: number },
+  atoms: { id: string; symbol: string }[]
+): number {
+  const atom1 = bond.atom1Id ? atoms.find(a => a.id === bond.atom1Id) : null;
+  const atom2 = bond.atom2Id ? atoms.find(a => a.id === bond.atom2Id) : null;
+
+  if (atom1 && atom2) {
+    // 双头键：用实际原子对的键长
+    return getStandardBondLength(atom1.symbol, atom2.symbol, bond.order);
+  } else if (atom1) {
+    // 单头键（atom1有原子，atom2为空）：用atom1-C键长
+    return getStandardBondLength(atom1.symbol, 'C', bond.order);
+  } else if (atom2) {
+    // 单头键（atom2有原子，atom1为空）：用atom2-C键长
+    return getStandardBondLength(atom2.symbol, 'C', bond.order);
+  } else {
+    // 空键（两端都为空）：用C-C键长
+    return getStandardBondLength('C', 'C', bond.order);
+  }
 }
 
 // 根据杂化类型生成理想键方向（3D空间）
@@ -1277,15 +1317,200 @@ function rotateVector(v: { x: number; y: number; z: number }, q: { x: number; y:
   };
 }
 
+/**
+ * 在中心原子上新增一个键之前，一次性计算所有键（含新键）的理想位置。
+ * 解决问题：已有键方向可能偏离理想分布，直接用 calculateIdealBondDirection 算新键方向会出错。
+ * 思路：把"即将有N+1个键"的理想方向全部算好，旋转对齐到已有键，找出新键该去的方向，
+ *       同时返回已有邻居应调整到的位置（用于P/S等高价原子的重原子邻居调整）。
+ */
+export function computeOptimizedBondPositions(
+  molecule: Molecule,
+  centerAtomId: string,
+  newBondOrder: number
+): {
+  newBondDirection: { x: number; y: number; z: number };
+  neighborUpdates: {
+    type: 'atom' | 'empty';
+    id: string;
+    position: { x: number; y: number; z: number };
+    endpoint?: 'atom1' | 'atom2';
+  }[];
+} | null {
+  const centerAtom = molecule.atoms.find(a => a.id === centerAtomId);
+  if (!centerAtom) return null;
+
+  // 收集当前所有邻居的方向和信息
+  const currentBonds = molecule.bonds.filter(b => b.atom1Id === centerAtomId || b.atom2Id === centerAtomId);
+
+  interface NeighborInfo {
+    type: 'atom' | 'empty';
+    atomId?: string;
+    bondId?: string;
+    bondOrder: number;
+    currentDir: { x: number; y: number; z: number };
+    endpoint?: 'atom1' | 'atom2';
+  }
+
+  const neighbors: NeighborInfo[] = [];
+  for (const b of currentBonds) {
+    const isAtom1 = b.atom1Id === centerAtomId;
+    const otherId = isAtom1 ? b.atom2Id : b.atom1Id;
+    const emptyPos = isAtom1 ? b.atom2Position : b.atom1Position;
+
+    if (otherId !== null) {
+      const otherAtom = molecule.atoms.find(a => a.id === otherId);
+      if (!otherAtom) continue;
+      const dx = otherAtom.position.x - centerAtom.position.x;
+      const dy = otherAtom.position.y - centerAtom.position.y;
+      const dz = otherAtom.position.z - centerAtom.position.z;
+      const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (len < 0.001) continue;
+      neighbors.push({
+        type: 'atom',
+        atomId: otherId,
+        bondOrder: b.order,
+        currentDir: { x: dx / len, y: dy / len, z: dz / len },
+      });
+    } else if (emptyPos) {
+      const dx = emptyPos.x - centerAtom.position.x;
+      const dy = emptyPos.y - centerAtom.position.y;
+      const dz = emptyPos.z - centerAtom.position.z;
+      const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (len < 0.001) continue;
+      neighbors.push({
+        type: 'empty',
+        bondId: b.id,
+        bondOrder: b.order,
+        currentDir: { x: dx / len, y: dy / len, z: dz / len },
+        endpoint: isAtom1 ? 'atom2' : 'atom1',
+      });
+    }
+  }
+
+  // 拼接后的总键数
+  const totalCount = neighbors.length + 1;
+  const maxBondOrder = Math.max(newBondOrder, ...neighbors.map(n => n.bondOrder));
+
+  // 判定杂化类型
+  let hybridization: 'sp' | 'sp2' | 'sp3';
+  if (totalCount >= 4) {
+    hybridization = 'sp3';
+  } else if (maxBondOrder === 3) {
+    hybridization = 'sp';
+  } else if (maxBondOrder === 2) {
+    hybridization = 'sp2';
+  } else {
+    hybridization = 'sp3';
+  }
+
+  const idealDirs = getIdealDirections3D(hybridization, totalCount);
+  if (idealDirs.length !== totalCount) return null;
+
+  // 贪心匹配：为每个已有邻居找最佳匹配的理想方向
+  const matched = new Set<number>(); // 已被匹配的ideal方向索引
+  const neighborToIdeal = new Map<number, number>(); // neighborIdx -> idealIdx
+
+  for (let ni = 0; ni < neighbors.length; ni++) {
+    let bestIdealIdx = -1;
+    let bestDot = -2;
+    for (let ii = 0; ii < idealDirs.length; ii++) {
+      if (matched.has(ii)) continue;
+      const dot = neighbors[ni].currentDir.x * idealDirs[ii].x +
+                  neighbors[ni].currentDir.y * idealDirs[ii].y +
+                  neighbors[ni].currentDir.z * idealDirs[ii].z;
+      if (dot > bestDot) {
+        bestDot = dot;
+        bestIdealIdx = ii;
+      }
+    }
+    if (bestIdealIdx >= 0) {
+      neighborToIdeal.set(ni, bestIdealIdx);
+      matched.add(bestIdealIdx);
+    }
+  }
+
+  // 找出未被匹配的理想方向 → 新键的方向
+  let newBondIdealIdx = -1;
+  for (let ii = 0; ii < idealDirs.length; ii++) {
+    if (!matched.has(ii)) {
+      newBondIdealIdx = ii;
+      break;
+    }
+  }
+  if (newBondIdealIdx < 0) return null;
+
+  // 用第一个已有邻居作为锚点，计算旋转四元数
+  if (neighbors.length === 0) {
+    // 没有已有键，新键方向就是理想方向本身
+    return {
+      newBondDirection: idealDirs[newBondIdealIdx],
+      neighborUpdates: [],
+    };
+  }
+
+  const anchorNi = 0;
+  const anchorIdealIdx = neighborToIdeal.get(anchorNi);
+  if (anchorIdealIdx === undefined) return null;
+
+  const rotQuat = computeRotationQuaternion(idealDirs[anchorIdealIdx], neighbors[anchorNi].currentDir);
+
+  // 旋转所有理想方向
+  const rotatedIdeals = idealDirs.map(d => rotateVector(d, rotQuat));
+
+  // 新键方向 = 旋转后的新键理想方向
+  const newBondDirection = rotatedIdeals[newBondIdealIdx];
+
+  // 计算已有邻居的新位置
+  const neighborUpdates: {
+    type: 'atom' | 'empty';
+    id: string;
+    position: { x: number; y: number; z: number };
+    endpoint?: 'atom1' | 'atom2';
+  }[] = [];
+
+  for (let ni = 0; ni < neighbors.length; ni++) {
+    const n = neighbors[ni];
+    const ii = neighborToIdeal.get(ni);
+    if (ii === undefined) continue;
+
+    // 只对P/S中心原子的重原子邻居做位置调整（其他情况只调整H和空头键）
+    const isHeavyAtom = n.type === 'atom' && n.atomId;
+    const otherAtom = n.type === 'atom' && n.atomId ? molecule.atoms.find(a => a.id === n.atomId) : null;
+    const isHeavyNonH = otherAtom && otherAtom.symbol !== 'H';
+    const isPS = centerAtom.symbol === 'P' || centerAtom.symbol === 'S';
+
+    if (isHeavyNonH && !isPS) continue; // 非P/S中心原子，不调整重原子
+
+    const neighborSymbol = otherAtom ? otherAtom.symbol : 'C';
+    const targetLength = getStandardBondLength(centerAtom.symbol, neighborSymbol, n.bondOrder);
+    const idealDir = rotatedIdeals[ii];
+    const newPos = {
+      x: centerAtom.position.x + idealDir.x * targetLength,
+      y: centerAtom.position.y + idealDir.y * targetLength,
+      z: centerAtom.position.z + idealDir.z * targetLength,
+    };
+
+    if (n.type === 'atom' && n.atomId) {
+      neighborUpdates.push({ type: 'atom', id: n.atomId, position: newPos });
+    } else if (n.type === 'empty' && n.bondId) {
+      neighborUpdates.push({ type: 'empty', id: n.bondId, position: newPos, endpoint: n.endpoint });
+    }
+  }
+
+  return { newBondDirection, neighborUpdates };
+}
+
 // 键吸附后优化原子周围的几何结构
 // 只移动H原子和空头键，重原子（非H）保持不动
 // excludeAtomIds: 额外排除的原子（如公团侧已平移到位的原子）
+// movableAtomIds: 允许移动的重原子（如新插入的公团原子，虽然是重原子但可以调整位置）
 export function optimizeGeometryAroundAtom(
   molecule: Molecule,
   centerAtomId: string,
   updateAtomPosition: (atomId: string, position: { x: number; y: number; z: number }) => void,
   updateBondPosition?: (bondId: string, params: { atom1Position?: { x: number; y: number; z: number }; atom2Position?: { x: number; y: number; z: number } }) => void,
-  excludeAtomIds?: Set<string>
+  excludeAtomIds?: Set<string>,
+  movableAtomIds?: Set<string>
 ): void {
   const centerAtom = molecule.atoms.find(a => a.id === centerAtomId);
   if (!centerAtom) return;
@@ -1344,17 +1569,33 @@ export function optimizeGeometryAroundAtom(
 
   if (neighbors.length < 2) return;
 
-  // 构建排除集：外部传入的 + 所有非H原子（重原子不动）
+  // 构建排除集：外部传入的 + 所有非H原子（重原子不动），但movableAtomIds中的重原子可以移动
   const allExclude = new Set<string>(excludeAtomIds || []);
   for (const n of neighbors) {
     if (n.type === 'atom' && n.atom && n.atom.symbol !== 'H') {
+      // 如果该重原子在movableAtomIds中，则不排除（允许移动）
+      if (movableAtomIds && movableAtomIds.has(n.atomId!)) continue;
       allExclude.add(n.atomId!);
     }
+  }
+
+  // 调试日志：P/S原子打印优化详情
+  if (centerAtom.symbol === 'P' || centerAtom.symbol === 'S') {
+    console.log(`[optimizeGeometry] ${centerAtom.symbol} neighbors=${neighbors.length} excludeAtomIds=${excludeAtomIds ? Array.from(excludeAtomIds).join(',') : 'none'} allExcludeSize=${allExclude.size}`);
+    neighbors.forEach((n, i) => {
+      if (n.type === 'atom') {
+        console.log(`  [${i}] ${n.atom?.symbol} atomId=${n.atomId?.slice(-6)} inExclude=${allExclude.has(n.atomId!)} isH=${n.atom?.symbol === 'H'}`);
+      } else {
+        console.log(`  [${i}] empty bondId=${n.bondId?.slice(-6)}`);
+      }
+    });
   }
 
   // 第一步：修正H和空头键的键长（重原子不动）
   for (const neighbor of neighbors) {
     if (neighbor.type === 'atom' && allExclude.has(neighbor.atomId!)) continue;
+    // 只有H原子和空头键可以移动，非H重原子不动
+    if (neighbor.type === 'atom' && neighbor.atom && neighbor.atom.symbol !== 'H') continue;
 
     const neighborSymbol = neighbor.type === 'atom' && neighbor.atom ? neighbor.atom.symbol : 'C';
     const targetLength = getStandardBondLength(centerAtom.symbol, neighborSymbol, neighbor.bondOrder);
@@ -1373,27 +1614,170 @@ export function optimizeGeometryAroundAtom(
 
       if (neighbor.type === 'atom' && neighbor.atomId) {
         updateAtomPosition(neighbor.atomId, newPos);
+        // 直接更新分子对象，确保后续validateMolecule读到正确数据
+        const atomInMol = molecule.atoms.find(a => a.id === neighbor.atomId);
+        if (atomInMol) atomInMol.position = newPos;
         if (neighbor.atom) neighbor.atom = { ...neighbor.atom, position: newPos };
       } else if (neighbor.type === 'empty' && updateBondPosition) {
         const params: { atom1Position?: { x: number; y: number; z: number }; atom2Position?: { x: number; y: number; z: number } } = {};
         params[neighbor.endpoint === 'atom1' ? 'atom1Position' : 'atom2Position'] = newPos;
         updateBondPosition(neighbor.bondId, params);
+        // 直接更新分子对象
+        const bondInMol = molecule.bonds.find(b => b.id === neighbor.bondId);
+        if (bondInMol) {
+          if (neighbor.endpoint === 'atom1') bondInMol.atom1Position = newPos;
+          else bondInMol.atom2Position = newPos;
+        }
       }
       neighbor.currentPosition = newPos;
     }
   }
 
   // 第二步：修正键角（只移动H和空头键，重原子作为锚点不动）
-  const hybridization = centerAtom.hybridization || 'sp3';
+  // 根据当前键数和键级重新判定杂化类型（拼接后键数可能变化）
+  const maxBondOrder = Math.max(...neighbors.map(n => n.bondOrder));
+  let hybridization: 'sp' | 'sp2' | 'sp3';
+  if (neighbors.length >= 4) {
+    hybridization = 'sp3';
+  } else if (maxBondOrder === 3) {
+    hybridization = 'sp';
+  } else if (maxBondOrder === 2) {
+    hybridization = 'sp2';
+  } else {
+    hybridization = 'sp3';
+  }
+  centerAtom.hybridization = hybridization;
+
+  // 收集可移动邻居的索引（只有H原子和空头键端点可移动，非H重原子不动）
+  const movableIndices: number[] = [];
+  for (let ni = 0; ni < neighbors.length; ni++) {
+    const n = neighbors[ni];
+    if (n.type === 'atom' && n.atomId && allExclude.has(n.atomId)) continue;
+    // 只有H原子和空头键可以移动，非H重原子不动
+    if (n.type === 'atom' && n.atom && n.atom.symbol !== 'H') continue;
+    movableIndices.push(ni);
+  }
+
+  if (movableIndices.length === 0) return;
+
+  // 调试日志：P/S原子打印可移动邻居
+  if (centerAtom.symbol === 'P' || centerAtom.symbol === 'S') {
+    console.log(`[optimizeGeometry] ${centerAtom.symbol} hybridization=${hybridization} movableIndices=[${movableIndices.join(',')}]`);
+  }
+
+  // 直接计算法：sp3满足 d1+d2+d3+d4=0，sp2满足 d1+d2+d3=0
+  // 可移动邻居的方向 = -(固定邻居方向之和)，归一化
+  // 这比贪心匹配+旋转更稳健，因为单锚点旋转无法保证所有方向正确对齐
+  if (hybridization === 'sp3' || hybridization === 'sp2') {
+    // 计算所有固定邻居的方向之和
+    const fixedSum = { x: 0, y: 0, z: 0 };
+    for (let ni = 0; ni < neighbors.length; ni++) {
+      if (movableIndices.includes(ni)) continue;
+      const n = neighbors[ni];
+      const dx = n.currentPosition.x - centerAtom.position.x;
+      const dy = n.currentPosition.y - centerAtom.position.y;
+      const dz = n.currentPosition.z - centerAtom.position.z;
+      const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+      if (len < 0.001) continue;
+      fixedSum.x += dx / len;
+      fixedSum.y += dy / len;
+      fixedSum.z += dz / len;
+    }
+
+    if (movableIndices.length === 1) {
+      // 1个可移动邻居：方向 = -fixedSum，归一化
+      const fixedSumLen = Math.sqrt(fixedSum.x * fixedSum.x + fixedSum.y * fixedSum.y + fixedSum.z * fixedSum.z);
+      if (fixedSumLen > 0.001) {
+        const idealDir = { x: -fixedSum.x / fixedSumLen, y: -fixedSum.y / fixedSumLen, z: -fixedSum.z / fixedSumLen };
+        const n = neighbors[movableIndices[0]];
+        const neighborSymbol = n.type === 'atom' && n.atom ? n.atom.symbol : 'C';
+        const targetLength = getStandardBondLength(centerAtom.symbol, neighborSymbol, n.bondOrder);
+        const newPos = {
+          x: centerAtom.position.x + idealDir.x * targetLength,
+          y: centerAtom.position.y + idealDir.y * targetLength,
+          z: centerAtom.position.z + idealDir.z * targetLength,
+        };
+        if (n.type === 'atom' && n.atomId) {
+          updateAtomPosition(n.atomId, newPos);
+          const atomInMol = molecule.atoms.find(a => a.id === n.atomId);
+          if (atomInMol) atomInMol.position = newPos;
+        } else if (n.type === 'empty' && updateBondPosition) {
+          const params: { atom1Position?: { x: number; y: number; z: number }; atom2Position?: { x: number; y: number; z: number } } = {};
+          params[n.endpoint === 'atom1' ? 'atom1Position' : 'atom2Position'] = newPos;
+          updateBondPosition(n.bondId, params);
+          const bondInMol = molecule.bonds.find(b => b.id === n.bondId);
+          if (bondInMol) {
+            if (n.endpoint === 'atom1') bondInMol.atom1Position = newPos;
+            else bondInMol.atom2Position = newPos;
+          }
+        }
+      }
+      return;
+    }
+
+    // 2+个可移动邻居：需要将 -fixedSum 分配给多个可移动邻居
+    // 策略：每个可移动邻居的方向 = -(fixedSum + 其他可移动邻居方向)
+    // 迭代优化：先用贪心匹配+旋转得到初始位置，再用直接计算微调
+    // 简化实现：对每个可移动邻居，排除其他可移动邻居后计算方向
+    // 更好的方法：用贪心匹配+双锚点旋转
+    // 目前先用贪心匹配+单锚点旋转，后续优化
+  }
+
+  // 非sp3或sp3+2+可移动邻居：使用贪心匹配+旋转方法
   const idealDirs = getIdealDirections3D(hybridization, neighbors.length);
   if (idealDirs.length !== neighbors.length) return;
   if (neighbors.length === 2) return;
 
-  // 选择锚点：优先选择被排除的重原子（不动），其次选第一个邻居
-  let anchorIdx = neighbors.findIndex(n =>
-    n.type === 'atom' && n.atomId && allExclude.has(n.atomId)
-  );
-  if (anchorIdx < 0) anchorIdx = 0;
+  // 贪心匹配：为每个邻居找最佳匹配的理想方向（按点积最大匹配）
+  const matched = new Set<number>(); // 已被匹配的ideal方向索引
+  const neighborToIdeal = new Map<number, number>(); // neighborIdx -> idealIdx
+
+  for (let ni = 0; ni < neighbors.length; ni++) {
+    const n = neighbors[ni];
+    const dir = {
+      x: n.currentPosition.x - centerAtom.position.x,
+      y: n.currentPosition.y - centerAtom.position.y,
+      z: n.currentPosition.z - centerAtom.position.z,
+    };
+    const dirLen = Math.sqrt(dir.x * dir.x + dir.y * dir.y + dir.z * dir.z);
+    if (dirLen < 0.001) continue;
+    const dirNorm = { x: dir.x / dirLen, y: dir.y / dirLen, z: dir.z / dirLen };
+
+    let bestIdealIdx = -1;
+    let bestDot = -2;
+    for (let ii = 0; ii < idealDirs.length; ii++) {
+      if (matched.has(ii)) continue;
+      const dot = dirNorm.x * idealDirs[ii].x + dirNorm.y * idealDirs[ii].y + dirNorm.z * idealDirs[ii].z;
+      if (dot > bestDot) {
+        bestDot = dot;
+        bestIdealIdx = ii;
+      }
+    }
+    if (bestIdealIdx >= 0) {
+      neighborToIdeal.set(ni, bestIdealIdx);
+      matched.add(bestIdealIdx);
+    }
+  }
+
+  // 选择锚点：优先选择被排除的重原子（不动），其次选第一个有匹配的邻居
+  let anchorIdx = -1;
+  for (let ni = 0; ni < neighbors.length; ni++) {
+    const n = neighbors[ni];
+    if (n.type === 'atom' && n.atomId && allExclude.has(n.atomId) && neighborToIdeal.has(ni)) {
+      anchorIdx = ni;
+      break;
+    }
+  }
+  if (anchorIdx < 0) {
+    for (const [ni] of neighborToIdeal) {
+      anchorIdx = ni;
+      break;
+    }
+  }
+  if (anchorIdx < 0) return;
+
+  const anchorIdealIdx = neighborToIdeal.get(anchorIdx);
+  if (anchorIdealIdx === undefined) return;
 
   const anchorDir = {
     x: neighbors[anchorIdx].currentPosition.x - centerAtom.position.x,
@@ -1404,19 +1788,24 @@ export function optimizeGeometryAroundAtom(
   if (anchorLen < 0.001) return;
 
   const anchorDirNorm = { x: anchorDir.x / anchorLen, y: anchorDir.y / anchorLen, z: anchorDir.z / anchorLen };
-  const rotQuat = computeRotationQuaternion(idealDirs[anchorIdx], anchorDirNorm);
+  const rotQuat = computeRotationQuaternion(idealDirs[anchorIdealIdx], anchorDirNorm);
   const rotatedIdeals = idealDirs.map(d => rotateVector(d, rotQuat));
 
-  for (let i = 0; i < neighbors.length; i++) {
-    if (i === anchorIdx) continue;
+  for (let ni = 0; ni < neighbors.length; ni++) {
+    if (ni === anchorIdx) continue;
 
-    const n = neighbors[i];
-    // 跳过排除的原子（重原子）
+    const n = neighbors[ni];
+    // 跳过排除的原子（公团原子）
     if (n.type === 'atom' && n.atomId && allExclude.has(n.atomId)) continue;
+    // 只有H原子和空头键可以移动，非H重原子不动
+    if (n.type === 'atom' && n.atom && n.atom.symbol !== 'H') continue;
+
+    const ii = neighborToIdeal.get(ni);
+    if (ii === undefined) continue;
 
     const neighborSymbol = n.type === 'atom' && n.atom ? n.atom.symbol : 'C';
     const targetLength = getStandardBondLength(centerAtom.symbol, neighborSymbol, n.bondOrder);
-    const idealDir = rotatedIdeals[i];
+    const idealDir = rotatedIdeals[ii];
     const newPos = {
       x: centerAtom.position.x + idealDir.x * targetLength,
       y: centerAtom.position.y + idealDir.y * targetLength,
@@ -1425,15 +1814,23 @@ export function optimizeGeometryAroundAtom(
 
     if (n.type === 'atom' && n.atomId) {
       updateAtomPosition(n.atomId, newPos);
+      const atomInMol = molecule.atoms.find(a => a.id === n.atomId);
+      if (atomInMol) atomInMol.position = newPos;
     } else if (n.type === 'empty' && updateBondPosition) {
       const params: { atom1Position?: { x: number; y: number; z: number }; atom2Position?: { x: number; y: number; z: number } } = {};
       params[n.endpoint === 'atom1' ? 'atom1Position' : 'atom2Position'] = newPos;
       updateBondPosition(n.bondId, params);
+      const bondInMol = molecule.bonds.find(b => b.id === n.bondId);
+      if (bondInMol) {
+        if (n.endpoint === 'atom1') bondInMol.atom1Position = newPos;
+        else bondInMol.atom2Position = newPos;
+      }
     }
   }
 }
 
-// 收集以 atomId 为根的刚性子树（沿单键遍历，不经过双键/三键/环内键）
+// 收集以 atomId 为根的刚性子树
+// 沿所有键遍历收集原子（双键/三键连接的原子是刚性的，必须一起移动）
 // 返回子树中所有原子ID和空头键ID
 function collectRigidSubtree(
   molecule: Molecule,
@@ -1454,12 +1851,9 @@ function collectRigidSubtree(
       const neighborId = b.atom1Id === curId ? b.atom2Id : b.atom1Id;
       if (neighborId !== null && !visited.has(neighborId)) {
         visited.add(neighborId);
-        // 只沿单键遍历（双键/三键是刚性的，不旋转）
-        if (b.order === 1) {
-          queue.push(neighborId);
-        } else {
-          atomIds.add(neighborId); // 双键/三键连接的原子也属于子树，但不继续遍历
-        }
+        // 所有键连接的原子都属于子树，继续遍历
+        // （双键/三键连接的原子是刚性的，必须一起移动）
+        queue.push(neighborId);
       } else if (neighborId === null) {
         // 空头键
         emptyBondIds.add(b.id);
@@ -1470,16 +1864,27 @@ function collectRigidSubtree(
 }
 
 // 检测两组原子之间是否有范德华冲突
+// 排除直接键连的原子对（它们距离天然很近，不算冲突）
 function detectCollision(
   molecule: Molecule,
   groupA: Set<string>,
   groupB: Set<string>
 ): boolean {
+  // 预计算所有直接键连的原子对
+  const bondedPairs = new Set<string>();
+  for (const b of molecule.bonds) {
+    if (b.atom1Id && b.atom2Id) {
+      bondedPairs.add(`${b.atom1Id}-${b.atom2Id}`);
+      bondedPairs.add(`${b.atom2Id}-${b.atom1Id}`);
+    }
+  }
+
   for (const idA of groupA) {
     const atomA = molecule.atoms.find(a => a.id === idA);
     if (!atomA) continue;
     for (const idB of groupB) {
       if (groupA.has(idB)) continue; // 同组跳过
+      if (bondedPairs.has(`${idA}-${idB}`)) continue; // 直接键连跳过
       const atomB = molecule.atoms.find(a => a.id === idB);
       if (!atomB) continue;
       const dist = getDistance(atomA.position, atomB.position);
@@ -1520,24 +1925,231 @@ function rotatePointAroundAxis(
 
 // 拼接时保持官能团刚体姿态：
 // 1. 沿锚点方向平移公团到标准键长
+// 计算母团B上新键的理想接入方向（3D空间）
+// 基于B已有键的3D分布和杂化类型，计算第N+1个键应该在哪个方向
+// 返回单位方向向量，null表示无法计算
+export function calculateIdealBondDirection(
+  molecule: Molecule,
+  centerAtomId: string,
+  excludeNeighborIds?: Set<string>
+): { x: number; y: number; z: number } | null {
+  const centerAtom = molecule.atoms.find(a => a.id === centerAtomId);
+  if (!centerAtom) return null;
+
+  // 收集已有键的方向向量（归一化），跳过要排除的邻居（新键已经连接的原子）
+  const atomBonds = molecule.bonds.filter(b => b.atom1Id === centerAtomId || b.atom2Id === centerAtomId);
+  const existingDirs: { x: number; y: number; z: number; bondOrder: number }[] = [];
+
+  for (const bond of atomBonds) {
+    const otherId = bond.atom1Id === centerAtomId ? bond.atom2Id : bond.atom1Id;
+    // 跳过被排除的邻居（新键已连接的原子）
+    if (otherId !== null && excludeNeighborIds && excludeNeighborIds.has(otherId)) {
+      continue;
+    }
+    if (otherId === null) {
+      // 空头键：用空头位置
+      const emptyPos = bond.atom1Id === centerAtomId ? bond.atom2Position : bond.atom1Position;
+      if (emptyPos) {
+        const dx = emptyPos.x - centerAtom.position.x;
+        const dy = emptyPos.y - centerAtom.position.y;
+        const dz = emptyPos.z - centerAtom.position.z;
+        const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (len > 0.001) {
+          existingDirs.push({ x: dx / len, y: dy / len, z: dz / len, bondOrder: bond.order });
+        }
+      }
+    } else {
+      const otherAtom = molecule.atoms.find(a => a.id === otherId);
+      if (otherAtom) {
+        const dx = otherAtom.position.x - centerAtom.position.x;
+        const dy = otherAtom.position.y - centerAtom.position.y;
+        const dz = otherAtom.position.z - centerAtom.position.z;
+        const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (len > 0.001) {
+          existingDirs.push({ x: dx / len, y: dy / len, z: dz / len, bondOrder: bond.order });
+        }
+      }
+    }
+  }
+
+  if (existingDirs.length === 0) {
+    // 没有已有键，默认沿+X方向
+    return { x: 1, y: 0, z: 0 };
+  }
+
+  // 预测拼接后的总键数 = 已有键数 + 1（新键）
+  const totalCount = existingDirs.length + 1;
+  const maxBondOrder = Math.max(...existingDirs.map(d => d.bondOrder));
+
+  // 调试日志
+  if (centerAtom.symbol === 'P' || centerAtom.symbol === 'S') {
+    console.log(`[calculateIdealBondDirection] ${centerAtom.symbol} existingDirs=${existingDirs.length} totalCount=${totalCount} excludeIds=${excludeNeighborIds ? Array.from(excludeNeighborIds).join(',') : 'none'}`);
+    existingDirs.forEach((d, i) => {
+      console.log(`  [${i}] dir=(${d.x.toFixed(3)}, ${d.y.toFixed(3)}, ${d.z.toFixed(3)}) bondOrder=${d.bondOrder}`);
+    });
+  }
+
+  // 判定杂化类型
+  let hybridization: 'sp' | 'sp2' | 'sp3';
+  if (totalCount >= 4) {
+    hybridization = 'sp3';
+  } else if (maxBondOrder === 3) {
+    hybridization = 'sp';
+  } else if (maxBondOrder === 2) {
+    hybridization = 'sp2';
+  } else {
+    hybridization = 'sp3';
+  }
+
+  // 特殊处理：sp2双键 + 2个单键（共3个键）的情况，新键在双键对面
+  // 检查是否存在双键
+  const hasDoubleBond = existingDirs.some(d => d.bondOrder === 2);
+  const hasTripleBond = existingDirs.some(d => d.bondOrder === 3);
+
+  if (hybridization === 'sp' && totalCount === 2) {
+    // sp杂化：新键与第一个键共线（反方向）
+    const existing = existingDirs[0];
+    return { x: -existing.x, y: -existing.y, z: -existing.z };
+  }
+
+  if (hybridization === 'sp2' && totalCount === 3) {
+    // sp2杂化 + 2个已有键 + 1个新键：平面内120°
+    // sp2的3个方向满足 d1+d2+d3=0（平面内120°对称）
+    // 新键方向 = -(v1+v2)，归一化，保证在已有键所在平面内
+    const v1 = existingDirs[0];
+    const v2 = existingDirs[1];
+    const sum = {
+      x: -(v1.x + v2.x),
+      y: -(v1.y + v2.y),
+      z: -(v1.z + v2.z),
+    };
+    const sumLen = Math.sqrt(sum.x * sum.x + sum.y * sum.y + sum.z * sum.z);
+
+    if (sumLen > 0.001) {
+      return { x: sum.x / sumLen, y: sum.y / sumLen, z: sum.z / sumLen };
+    }
+    // 退化情况：v1和v2几乎反向，取叉积方向（垂直于平面）
+    const crossX = v1.y * v2.z - v1.z * v2.y;
+    const crossY = v1.z * v2.x - v1.x * v2.z;
+    const crossZ = v1.x * v2.y - v1.y * v2.x;
+    const crossLen = Math.sqrt(crossX * crossX + crossY * crossY + crossZ * crossZ);
+    if (crossLen > 0.001) {
+      return { x: crossX / crossLen, y: crossY / crossLen, z: crossZ / crossLen };
+    }
+    return { x: 1, y: 0, z: 0 };
+  }
+
+  if (hybridization === 'sp3' && totalCount === 2) {
+    // sp3杂化 + 2个键：新键与第一个键呈109.5°（或反方向）
+    // 简化：取与第一个键的垂直方向作为新键
+    const v1 = existingDirs[0];
+    const perp = Math.abs(v1.x) < 0.9 ? { x: 1, y: 0, z: 0 } : { x: 0, y: 1, z: 0 };
+    // 叉积
+    const crossX = v1.y * perp.z - v1.z * perp.y;
+    const crossY = v1.z * perp.x - v1.x * perp.z;
+    const crossZ = v1.x * perp.y - v1.y * perp.x;
+    const crossLen = Math.sqrt(crossX * crossX + crossY * crossY + crossZ * crossZ);
+    if (crossLen > 0.001) {
+      return { x: crossX / crossLen, y: crossY / crossLen, z: crossZ / crossLen };
+    }
+    return { x: 1, y: 0, z: 0 };
+  }
+
+  if (hybridization === 'sp3' && totalCount === 3) {
+    // sp3杂化 + 3个键：新键方向 = -(v1 + v2 + v3)（4个sp3方向的和为0）
+    // 这是正四面体最重要的性质
+    const sum = { x: 0, y: 0, z: 0 };
+    for (const d of existingDirs) {
+      sum.x += d.x;
+      sum.y += d.y;
+      sum.z += d.z;
+    }
+    const sumLen = Math.sqrt(sum.x * sum.x + sum.y * sum.y + sum.z * sum.z);
+    if (sumLen > 0.001) {
+      return { x: -sum.x / sumLen, y: -sum.y / sumLen, z: -sum.z / sumLen };
+    }
+    // 如果3个键几乎抵消（接近四面体中心），取任意垂直方向
+    const v1 = existingDirs[0];
+    const v2 = existingDirs[1];
+    const crossX = v1.y * v2.z - v1.z * v2.y;
+    const crossY = v1.z * v2.x - v1.x * v2.z;
+    const crossZ = v1.x * v2.y - v1.y * v2.x;
+    const crossLen = Math.sqrt(crossX * crossX + crossY * crossY + crossZ * crossZ);
+    if (crossLen > 0.001) {
+      return { x: crossX / crossLen, y: crossY / crossLen, z: crossZ / crossLen };
+    }
+    return { x: 1, y: 0, z: 0 };
+  }
+
+  if (hybridization === 'sp3' && totalCount === 4) {
+    // sp3杂化 + 4个键（3个已有 + 1个新键）：正四面体 d1+d2+d3+d4=0
+    // 新键方向 = -(d1+d2+d3)，即已有3个方向的矢量和取反
+    const sum = { x: 0, y: 0, z: 0 };
+    for (const d of existingDirs) {
+      sum.x += d.x;
+      sum.y += d.y;
+      sum.z += d.z;
+    }
+    const sumLen = Math.sqrt(sum.x * sum.x + sum.y * sum.y + sum.z * sum.z);
+    if (sumLen > 0.001) {
+      return { x: -sum.x / sumLen, y: -sum.y / sumLen, z: -sum.z / sumLen };
+    }
+    // 退化情况：3个方向几乎抵消，取任意垂直方向
+    const v1 = existingDirs[0];
+    const v2 = existingDirs[1];
+    const crossX = v1.y * v2.z - v1.z * v2.y;
+    const crossY = v1.z * v2.x - v1.x * v2.z;
+    const crossZ = v1.x * v2.y - v1.y * v2.x;
+    const crossLen = Math.sqrt(crossX * crossX + crossY * crossY + crossZ * crossZ);
+    if (crossLen > 0.001) {
+      return { x: crossX / crossLen, y: crossY / crossLen, z: crossZ / crossLen };
+    }
+    return { x: 1, y: 0, z: 0 };
+  }
+
+  if (hybridization === 'sp3' && totalCount === 5) {
+    // sp3 + 5个键（如P的5价）：三角双锥构型
+    // 前3个键共面（120°），后2个键在轴上（180°）
+    // 取前3个键的矢量和取反 + 垂直分量
+    const sum = { x: 0, y: 0, z: 0 };
+    for (const d of existingDirs) {
+      sum.x += d.x;
+      sum.y += d.y;
+      sum.z += d.z;
+    }
+    const sumLen = Math.sqrt(sum.x * sum.x + sum.y * sum.y + sum.z * sum.z);
+    if (sumLen > 0.001) {
+      return { x: -sum.x / sumLen, y: -sum.y / sumLen, z: -sum.z / sumLen };
+    }
+    return { x: 1, y: 0, z: 0 };
+  }
+
+  // 默认回退：取任意垂直方向
+  const v1 = existingDirs[0];
+  const perp = Math.abs(v1.x) < 0.9 ? { x: 1, y: 0, z: 0 } : { x: 0, y: 1, z: 0 };
+  const crossX = v1.y * perp.z - v1.z * perp.y;
+  const crossY = v1.z * perp.x - v1.x * perp.z;
+  const crossZ = v1.x * perp.y - v1.y * perp.x;
+  const crossLen = Math.sqrt(crossX * crossX + crossY * crossY + crossZ * crossZ);
+  if (crossLen > 0.001) {
+    return { x: crossX / crossLen, y: crossY / crossLen, z: crossZ / crossLen };
+  }
+  return { x: 1, y: 0, z: 0 };
+}
+
 // 2. 检测空间冲突，如有冲突则绕连接键旋转母团可旋转子树以规避
+// idealDirection: 母团B上新键的理想接入方向（从B指向A），如有则按此方向放置A
 export function adjustAtomPreserveSubtree(
   molecule: Molecule,
   centerAtomId: string,
   anchorAtomId: string,
   updateAtomPosition: (atomId: string, position: { x: number; y: number; z: number }) => void,
-  updateBondPosition?: (bondId: string, params: { atom1Position?: { x: number; y: number; z: number }; atom2Position?: { x: number; y: number; z: number } }) => void
+  updateBondPosition?: (bondId: string, params: { atom1Position?: { x: number; y: number; z: number }; atom2Position?: { x: number; y: number; z: number } }) => void,
+  idealDirection?: { x: number; y: number; z: number } | null
 ): void {
   const centerAtom = molecule.atoms.find(a => a.id === centerAtomId);
   const anchorAtom = molecule.atoms.find(a => a.id === anchorAtomId);
   if (!centerAtom || !anchorAtom) return;
-
-  // 计算当前 center→anchor 方向和距离
-  const dx = centerAtom.position.x - anchorAtom.position.x;
-  const dy = centerAtom.position.y - anchorAtom.position.y;
-  const dz = centerAtom.position.z - anchorAtom.position.z;
-  const currentLength = Math.sqrt(dx * dx + dy * dy + dz * dz);
-  if (currentLength < 0.01) return;
 
   // 获取键级
   const bond = molecule.bonds.find(b =>
@@ -1547,146 +2159,198 @@ export function adjustAtomPreserveSubtree(
   const order = bond?.order || 1;
   const targetLength = getStandardBondLength(anchorAtom.symbol, centerAtom.symbol, order);
 
-  // 如果键长已经足够接近，跳过平移
-  if (Math.abs(currentLength - targetLength) > 0.05) {
+  // 计算A的新位置：优先使用理想方向，否则沿当前拖拽方向
+  let newCenterPos: { x: number; y: number; z: number };
+  if (idealDirection) {
+    // 按理想方向放置A：A = B + idealDir * targetLength
+    newCenterPos = {
+      x: anchorAtom.position.x + idealDirection.x * targetLength,
+      y: anchorAtom.position.y + idealDirection.y * targetLength,
+      z: anchorAtom.position.z + idealDirection.z * targetLength,
+    };
+  } else {
+    // 沿当前B→A方向调整键长
+    const dx = centerAtom.position.x - anchorAtom.position.x;
+    const dy = centerAtom.position.y - anchorAtom.position.y;
+    const dz = centerAtom.position.z - anchorAtom.position.z;
+    const currentLength = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (currentLength < 0.01) return;
     const scale = targetLength / currentLength;
-    const newCenterPos = {
+    newCenterPos = {
       x: anchorAtom.position.x + dx * scale,
       y: anchorAtom.position.y + dy * scale,
       z: anchorAtom.position.z + dz * scale,
     };
-    const offsetX = newCenterPos.x - centerAtom.position.x;
-    const offsetY = newCenterPos.y - centerAtom.position.y;
-    const offsetZ = newCenterPos.z - centerAtom.position.z;
+  }
 
-    // 移动中心原子
-    updateAtomPosition(centerAtomId, newCenterPos);
+  const offsetX = newCenterPos.x - centerAtom.position.x;
+  const offsetY = newCenterPos.y - centerAtom.position.y;
+  const offsetZ = newCenterPos.z - centerAtom.position.z;
 
-    // 平移公团子树（所有通过键连接的非锚点原子和空头键）
-    const atomBonds = molecule.bonds.filter(b =>
-      b.atom1Id === centerAtomId || b.atom2Id === centerAtomId
-    );
-    for (const b of atomBonds) {
-      if (b.atom1Id === centerAtomId) {
-        if (b.atom2Id !== null && b.atom2Id !== anchorAtomId) {
-          const neighbor = molecule.atoms.find(a => a.id === b.atom2Id);
-          if (neighbor) {
-            updateAtomPosition(b.atom2Id, {
-              x: neighbor.position.x + offsetX,
-              y: neighbor.position.y + offsetY,
-              z: neighbor.position.z + offsetZ,
-            });
-          }
-        } else if (b.atom2Id === null && b.atom2Position && updateBondPosition) {
-          updateBondPosition(b.id, {
-            atom2Position: {
-              x: b.atom2Position.x + offsetX,
-              y: b.atom2Position.y + offsetY,
-              z: b.atom2Position.z + offsetZ,
-            },
-          });
-        }
-      } else if (b.atom2Id === centerAtomId) {
-        if (b.atom1Id !== null && b.atom1Id !== anchorAtomId) {
-          const neighbor = molecule.atoms.find(a => a.id === b.atom1Id);
-          if (neighbor) {
-            updateAtomPosition(b.atom1Id, {
-              x: neighbor.position.x + offsetX,
-              y: neighbor.position.y + offsetY,
-              z: neighbor.position.z + offsetZ,
-            });
-          }
-        } else if (b.atom1Id === null && b.atom1Position && updateBondPosition) {
-          updateBondPosition(b.id, {
-            atom1Position: {
-              x: b.atom1Position.x + offsetX,
-              y: b.atom1Position.y + offsetY,
-              z: b.atom1Position.z + offsetZ,
-            },
-          });
+  // 如果偏移量太小，跳过平移
+  if (Math.sqrt(offsetX * offsetX + offsetY * offsetY + offsetZ * offsetZ) < 0.05) {
+    // 偏移很小，但仍需处理子树中可能未跟随的原子
+  }
+
+  // 移动中心原子
+  updateAtomPosition(centerAtomId, newCenterPos);
+  // 直接更新分子对象
+  centerAtom.position = newCenterPos;
+
+  // 递归平移公团子树（所有通过键连接的非锚点原子和空头键）
+  // 使用BFS确保所有层级的原子和空头键都被平移
+  const visited = new Set<string>([centerAtomId, anchorAtomId]);
+  const queue: string[] = [centerAtomId];
+
+  while (queue.length > 0) {
+    const currentId = queue.shift()!;
+    const currentAtom = molecule.atoms.find(a => a.id === currentId);
+    if (!currentAtom) continue;
+
+    // 先处理当前原子的所有空头键端点（平移offsetX/Y/Z）
+    if (updateBondPosition) {
+      const emptyBonds = molecule.bonds.filter(b =>
+        (b.atom1Id === currentId && b.atom2Id === null && b.atom2Position) ||
+        (b.atom2Id === currentId && b.atom1Id === null && b.atom1Position)
+      );
+      for (const eb of emptyBonds) {
+        if (eb.atom1Id === currentId && eb.atom2Id === null && eb.atom2Position) {
+          const newPos = {
+            x: eb.atom2Position.x + offsetX,
+            y: eb.atom2Position.y + offsetY,
+            z: eb.atom2Position.z + offsetZ,
+          };
+          updateBondPosition(eb.id, { atom2Position: newPos });
+          eb.atom2Position = newPos; // 直接更新分子对象
+        } else if (eb.atom2Id === currentId && eb.atom1Id === null && eb.atom1Position) {
+          const newPos = {
+            x: eb.atom1Position.x + offsetX,
+            y: eb.atom1Position.y + offsetY,
+            z: eb.atom1Position.z + offsetZ,
+          };
+          updateBondPosition(eb.id, { atom1Position: newPos });
+          eb.atom1Position = newPos; // 直接更新分子对象
         }
       }
+    }
+
+    // 找到所有连接的真实原子邻居
+    const bonds = molecule.bonds.filter(b =>
+      (b.atom1Id === currentId && b.atom2Id !== null && !visited.has(b.atom2Id)) ||
+      (b.atom2Id === currentId && b.atom1Id !== null && !visited.has(b.atom1Id))
+    );
+
+    for (const b of bonds) {
+      // 确定邻居原子
+      let neighborId: string | null = null;
+
+      if (b.atom1Id === currentId && b.atom2Id !== null && !visited.has(b.atom2Id)) {
+        neighborId = b.atom2Id;
+      } else if (b.atom2Id === currentId && b.atom1Id !== null && !visited.has(b.atom1Id)) {
+        neighborId = b.atom1Id;
+      }
+
+      if (neighborId === null) continue;
+
+      const neighbor = molecule.atoms.find(a => a.id === neighborId);
+      if (!neighbor) continue;
+
+      // 使用offset平移（与空头键端点一致），确保刚体平移正确
+      // 注意：不能使用相对位置重算，因为currentAtom.position可能已被更新
+      const newNeighborPos = {
+        x: neighbor.position.x + offsetX,
+        y: neighbor.position.y + offsetY,
+        z: neighbor.position.z + offsetZ,
+      };
+      updateAtomPosition(neighborId, newNeighborPos);
+      neighbor.position = newNeighborPos; // 直接更新分子对象
+      visited.add(neighborId);
+      queue.push(neighborId);
     }
   }
 
   // 空间冲突检测和旋转规避
-  // 收集公团原子（centerAtom 及其子树，不含 anchorAtom）
+  // 规则：母团重原子不动，只旋转公团A来规避冲突
   const publicAtoms = collectRigidSubtree(molecule, centerAtomId, new Set([anchorAtomId]));
-  // 收集母团原子（anchorAtom 及其子树，不含 centerAtom）
   const privateAtoms = collectRigidSubtree(molecule, anchorAtomId, new Set([centerAtomId]));
 
   if (detectCollision(molecule, publicAtoms.atomIds, privateAtoms.atomIds)) {
-    // 有冲突：以连接键为轴，旋转母团可旋转子树
+    // 有冲突：以连接键为轴，旋转公团A来规避（母团B不动）
     const axisDir = {
       x: centerAtom.position.x - anchorAtom.position.x,
       y: centerAtom.position.y - anchorAtom.position.y,
       z: centerAtom.position.z - anchorAtom.position.z,
     };
 
-    // 找到母团中可旋转的子结构（通过单键连接到 anchorAtom 的重原子子树）
-    const rotatableBonds = molecule.bonds.filter(b => {
-      if (b.order !== 1) return false; // 只旋转单键
-      if (b.atom1Id === anchorAtomId && b.atom2Id !== null && b.atom2Id !== centerAtomId) return true;
-      if (b.atom2Id === anchorAtomId && b.atom1Id !== null && b.atom1Id !== centerAtomId) return true;
-      return false;
-    });
+    // 尝试每30°旋转一次公团A，找到无冲突的角度
+    let bestAngle = 0;
+    let bestCollision = true;
 
-    // 尝试每30°旋转一次，找到无冲突的角度
-    for (const rb of rotatableBonds) {
-      const childId = rb.atom1Id === anchorAtomId ? rb.atom2Id : rb.atom1Id;
-      if (!childId) continue;
-
-      // 收集这个子树
-      const subtree = collectRigidSubtree(molecule, childId, new Set([anchorAtomId]));
-
-      let bestAngle = 0;
-      let bestCollision = true;
-
-      for (let deg = 30; deg < 360; deg += 30) {
-        const angle = (deg * Math.PI) / 180;
-        // 模拟旋转后检测冲突
-        let hasCollision = false;
-        for (const sid of subtree.atomIds) {
-          const sAtom = molecule.atoms.find(a => a.id === sid);
-          if (!sAtom) continue;
-          const rotated = rotatePointAroundAxis(sAtom.position, anchorAtom.position, axisDir, angle);
-          for (const pid of publicAtoms.atomIds) {
+    for (let deg = 30; deg < 360; deg += 30) {
+      const angle = (deg * Math.PI) / 180;
+      // 模拟旋转公团A后检测冲突
+      let hasCollision = false;
+      for (const sid of publicAtoms.atomIds) {
+        const sAtom = molecule.atoms.find(a => a.id === sid);
+        if (!sAtom) continue;
+        const rotated = rotatePointAroundAxis(sAtom.position, anchorAtom.position, axisDir, angle);
+        for (const pid of privateAtoms.atomIds) {
+          const pAtom = molecule.atoms.find(a => a.id === pid);
+          if (!pAtom) continue;
+          const dist = getDistance(rotated, pAtom.position);
+          const vdwSum = getVdwRadius(sAtom.symbol) + getVdwRadius(pAtom.symbol);
+          if (dist < vdwSum * 0.7) { hasCollision = true; break; }
+        }
+        if (hasCollision) break;
+      }
+      // 也检查公团A的空头键端点
+      if (!hasCollision && updateBondPosition) {
+        for (const ebId of publicAtoms.emptyBondIds) {
+          const eb = molecule.bonds.find(b => b.id === ebId);
+          if (!eb) continue;
+          const emptyPos = eb.atom1Id !== null && publicAtoms.atomIds.has(eb.atom1Id) ? eb.atom2Position : eb.atom1Position;
+          if (!emptyPos) continue;
+          const rotated = rotatePointAroundAxis(emptyPos, anchorAtom.position, axisDir, angle);
+          for (const pid of privateAtoms.atomIds) {
             const pAtom = molecule.atoms.find(a => a.id === pid);
             if (!pAtom) continue;
             const dist = getDistance(rotated, pAtom.position);
-            const vdwSum = getVdwRadius(sAtom.symbol) + getVdwRadius(pAtom.symbol);
+            const vdwSum = getVdwRadius('?') + getVdwRadius(pAtom.symbol);
             if (dist < vdwSum * 0.7) { hasCollision = true; break; }
           }
           if (hasCollision) break;
         }
-
-        if (!hasCollision) {
-          bestAngle = angle;
-          bestCollision = false;
-          break;
-        }
       }
 
-      if (!bestCollision) {
-        // 应用最佳旋转角度
-        for (const sid of subtree.atomIds) {
-          const sAtom = molecule.atoms.find(a => a.id === sid);
-          if (!sAtom) continue;
-          const rotated = rotatePointAroundAxis(sAtom.position, anchorAtom.position, axisDir, bestAngle);
-          updateAtomPosition(sid, rotated);
-        }
-        // 旋转空头键
-        if (updateBondPosition) {
-          for (const ebId of subtree.emptyBondIds) {
-            const eb = molecule.bonds.find(b => b.id === ebId);
-            if (!eb) continue;
-            if (eb.atom1Id !== null && subtree.atomIds.has(eb.atom1Id) && eb.atom2Position) {
-              const rotated = rotatePointAroundAxis(eb.atom2Position, anchorAtom.position, axisDir, bestAngle);
-              updateBondPosition(ebId, { atom2Position: rotated });
-            } else if (eb.atom2Id !== null && subtree.atomIds.has(eb.atom2Id) && eb.atom1Position) {
-              const rotated = rotatePointAroundAxis(eb.atom1Position, anchorAtom.position, axisDir, bestAngle);
-              updateBondPosition(ebId, { atom1Position: rotated });
-            }
+      if (!hasCollision) {
+        bestAngle = angle;
+        bestCollision = false;
+        break;
+      }
+    }
+
+    if (!bestCollision) {
+      // 应用最佳旋转角度：只旋转公团A（母团B不动）
+      for (const sid of publicAtoms.atomIds) {
+        const sAtom = molecule.atoms.find(a => a.id === sid);
+        if (!sAtom) continue;
+        const rotated = rotatePointAroundAxis(sAtom.position, anchorAtom.position, axisDir, bestAngle);
+        updateAtomPosition(sid, rotated);
+        sAtom.position = rotated; // 直接更新分子对象
+      }
+      // 旋转公团A的空头键
+      if (updateBondPosition) {
+        for (const ebId of publicAtoms.emptyBondIds) {
+          const eb = molecule.bonds.find(b => b.id === ebId);
+          if (!eb) continue;
+          if (eb.atom1Id !== null && publicAtoms.atomIds.has(eb.atom1Id) && eb.atom2Position) {
+            const rotated = rotatePointAroundAxis(eb.atom2Position, anchorAtom.position, axisDir, bestAngle);
+            updateBondPosition(ebId, { atom2Position: rotated });
+            eb.atom2Position = rotated; // 直接更新分子对象
+          } else if (eb.atom2Id !== null && publicAtoms.atomIds.has(eb.atom2Id) && eb.atom1Position) {
+            const rotated = rotatePointAroundAxis(eb.atom1Position, anchorAtom.position, axisDir, bestAngle);
+            updateBondPosition(ebId, { atom1Position: rotated });
+            eb.atom1Position = rotated; // 直接更新分子对象
           }
         }
       }
@@ -1858,7 +2522,7 @@ export function validateMolecule(molecule: Molecule): ValidationResult {
   const ringAtomSets = findRingAtomSets(molecule);
   
   for (const atom of molecule.atoms) {
-    if (atom.symbol !== 'C' && atom.symbol !== 'N' && atom.symbol !== 'O') continue;
+    if (atom.symbol !== 'C' && atom.symbol !== 'N' && atom.symbol !== 'O' && atom.symbol !== 'P' && atom.symbol !== 'S') continue;
     
     const hybridization = atom.hybridization;
     if (!hybridization) continue;
@@ -1872,25 +2536,61 @@ export function validateMolecule(molecule: Molecule): ValidationResult {
     
     if (bonds.length < 2) continue;
     
-    const connectedAtoms = bonds.map(b => 
-      molecule.atoms.find(a => a.id === (b.atom1Id === atom.id ? b.atom2Id : b.atom1Id))
-    ).filter(Boolean);
+    // 收集所有"连接点"，包括真实原子和空头键端点
+    // 每个连接点有：位置（position）和"符号"（真实原子的symbol或"?"代表空头键）
+    const connectedPoints: { position: { x: number; y: number; z: number }; symbol: string; atomId?: string }[] = [];
     
-    if (connectedAtoms.length < 2) continue;
+    for (const b of bonds) {
+      if (b.atom1Id === atom.id) {
+        if (b.atom2Id !== null) {
+          const other = molecule.atoms.find(a => a.id === b.atom2Id);
+          if (other) connectedPoints.push({ position: other.position, symbol: other.symbol, atomId: other.id });
+        } else if (b.atom2Position) {
+          connectedPoints.push({ position: b.atom2Position, symbol: '?' });
+        }
+      } else {
+        if (b.atom1Id !== null) {
+          const other = molecule.atoms.find(a => a.id === b.atom1Id);
+          if (other) connectedPoints.push({ position: other.position, symbol: other.symbol, atomId: other.id });
+        } else if (b.atom1Position) {
+          connectedPoints.push({ position: b.atom1Position, symbol: '?' });
+        }
+      }
+    }
     
+    if (connectedPoints.length < 2) continue;
+
+    // 调试日志：P/S原子打印所有连接点和键角
+    if (atom.symbol === 'P' || atom.symbol === 'S') {
+      console.log(`[validateMolecule] ${atom.symbol}(${hybridization}) center=(${atom.position.x.toFixed(3)}, ${atom.position.y.toFixed(3)}, ${atom.position.z.toFixed(3)})`);
+      connectedPoints.forEach((p, idx) => {
+        const dx = p.position.x - atom.position.x;
+        const dy = p.position.y - atom.position.y;
+        const dz = p.position.z - atom.position.z;
+        const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        console.log(`  [${idx}] ${p.symbol} atomId=${p.atomId || '(empty)'} pos=(${p.position.x.toFixed(3)}, ${p.position.y.toFixed(3)}, ${p.position.z.toFixed(3)}) dist=${len.toFixed(3)}`);
+      });
+      for (let di = 0; di < connectedPoints.length; di++) {
+        for (let dj = di + 1; dj < connectedPoints.length; dj++) {
+          const dAngle = getAngle(connectedPoints[di].position, atom.position, connectedPoints[dj].position);
+          console.log(`  ${connectedPoints[di].symbol}-${atom.symbol}-${connectedPoints[dj].symbol}: ${dAngle.toFixed(1)}° (偏差${Math.abs(dAngle - expectedAngle).toFixed(1)}°)`);
+        }
+      }
+    }
+
     // 检查所有相邻键之间的角度
-    for (let i = 0; i < connectedAtoms.length; i++) {
-      for (let j = i + 1; j < connectedAtoms.length; j++) {
+    for (let i = 0; i < connectedPoints.length; i++) {
+      for (let j = i + 1; j < connectedPoints.length; j++) {
         // 如果三个原子都在同一个环内，跳过键角检查（环内键角由环大小决定）
-        const allInSameRing = ringAtomSets.some(ringSet =>
-          ringSet.has(atom.id) && ringSet.has(connectedAtoms[i]!.id) && ringSet.has(connectedAtoms[j]!.id)
+        const allInSameRing = connectedPoints[i].atomId && connectedPoints[j].atomId && ringAtomSets.some(ringSet =>
+          ringSet.has(atom.id) && ringSet.has(connectedPoints[i].atomId!) && ringSet.has(connectedPoints[j].atomId!)
         );
         if (allInSameRing) continue;
 
         const angle = getAngle(
-          connectedAtoms[i]!.position,
+          connectedPoints[i].position,
           atom.position,
-          connectedAtoms[j]!.position
+          connectedPoints[j].position
         );
         
         const deviation = Math.abs(angle - expectedAngle);
@@ -1898,14 +2598,14 @@ export function validateMolecule(molecule: Molecule): ValidationResult {
         if (deviation > 30) {
           issues.push({
             type: 'error',
-            message: `${atom.symbol}(${hybridization})键角异常：${connectedAtoms[i]!.symbol}-${atom.symbol}-${connectedAtoms[j]!.symbol}角度${angle.toFixed(1)}°，预期${expectedAngle}°，偏差${deviation.toFixed(1)}°`,
-            atomIds: [connectedAtoms[i]!.id, atom.id, connectedAtoms[j]!.id]
+            message: `${atom.symbol}(${hybridization})键角异常：${connectedPoints[i].symbol}-${atom.symbol}-${connectedPoints[j].symbol}角度${angle.toFixed(1)}°，预期${expectedAngle}°，偏差${deviation.toFixed(1)}°`,
+            atomIds: [connectedPoints[i].atomId || '', atom.id, connectedPoints[j].atomId || '']
           });
         } else if (deviation > 15) {
           issues.push({
             type: 'warning',
-            message: `${atom.symbol}(${hybridization})键角偏差：${connectedAtoms[i]!.symbol}-${atom.symbol}-${connectedAtoms[j]!.symbol}角度${angle.toFixed(1)}°，预期${expectedAngle}°，偏差${deviation.toFixed(1)}°`,
-            atomIds: [connectedAtoms[i]!.id, atom.id, connectedAtoms[j]!.id]
+            message: `${atom.symbol}(${hybridization})键角偏差：${connectedPoints[i].symbol}-${atom.symbol}-${connectedPoints[j].symbol}角度${angle.toFixed(1)}°，预期${expectedAngle}°，偏差${deviation.toFixed(1)}°`,
+            atomIds: [connectedPoints[i].atomId || '', atom.id, connectedPoints[j].atomId || '']
           });
         }
       }

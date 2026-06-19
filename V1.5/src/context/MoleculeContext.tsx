@@ -1,7 +1,7 @@
 import React, { createContext, useContext, useReducer, useCallback, useEffect } from 'react';
 import type { Molecule, ToolType, RenderMode, Atom, Bond, AnalysisResult } from '../types';
 export type { Atom } from '../types';
-import { generateUUID, calculateMolecularWeight, calculateFormula, calculateUnsaturation, analyzeHybridization, findAllCollinearGroups, findAllCoplanarGroups, getElementColor, validateMolecule, printValidationResult, hasFreeValence, getAvailableValence } from '../utils/chemistry';
+import { generateUUID, calculateMolecularWeight, calculateFormula, calculateUnsaturation, analyzeHybridization, findAllCollinearGroups, findAllCoplanarGroups, getElementColor, validateMolecule, printValidationResult, hasFreeValence, getAvailableValence, getBondLengthForState } from '../utils/chemistry';
 import { createMethaneMolecule } from '../utils/molecules';
 import { getFunctionalGroupById } from '../utils/functionalGroups';
 
@@ -193,21 +193,62 @@ function moleculeReducer(state: MoleculeState, action: MoleculeAction): Molecule
  const newAtoms = state.molecule.atoms.filter(a => a.id !== action.payload.id);
  const removedAtom = state.molecule.atoms.find(a => a.id === action.payload.id);
  const newBonds = state.molecule.bonds.map(bond => {
- if (bond.atom1Id === action.payload.id) {
- return {
- ...bond,
- atom1Id: null,
- atom1Position: removedAtom?.position
- };
- }
- if (bond.atom2Id === action.payload.id) {
- return {
- ...bond,
- atom2Id: null,
- atom2Position: removedAtom?.position
- };
- }
- return bond;
+   if (bond.atom1Id === action.payload.id) {
+     // 删除atom1端的原子，键变为单头或空键
+     const updatedBond: Bond = {
+       ...bond,
+       atom1Id: null,
+       atom1Position: removedAtom?.position
+     };
+     // 根据键长规则调整空头端点位置
+     // 计算正确的键长：空键用C-C，单头用原子-C
+     const targetLength = getBondLengthForState(updatedBond, newAtoms);
+     const anchorAtom = updatedBond.atom2Id ? newAtoms.find(a => a.id === updatedBond.atom2Id) : null;
+     const anchorPos = anchorAtom ? anchorAtom.position : (updatedBond.atom2Position || removedAtom?.position);
+     if (anchorPos && updatedBond.atom1Position) {
+       const dx = updatedBond.atom1Position.x - anchorPos.x;
+       const dy = updatedBond.atom1Position.y - anchorPos.y;
+       const dz = updatedBond.atom1Position.z - anchorPos.z;
+       const currentLen = Math.sqrt(dx * dx + dy * dy + dz * dz);
+       if (currentLen > 0.01) {
+         const scale = targetLength / currentLen;
+         updatedBond.atom1Position = {
+           x: anchorPos.x + dx * scale,
+           y: anchorPos.y + dy * scale,
+           z: anchorPos.z + dz * scale,
+         };
+       }
+     }
+     return updatedBond;
+   }
+   if (bond.atom2Id === action.payload.id) {
+     // 删除atom2端的原子，键变为单头或空键
+     const updatedBond: Bond = {
+       ...bond,
+       atom2Id: null,
+       atom2Position: removedAtom?.position
+     };
+     // 根据键长规则调整空头端点位置
+     const targetLength = getBondLengthForState(updatedBond, newAtoms);
+     const anchorAtom = updatedBond.atom1Id ? newAtoms.find(a => a.id === updatedBond.atom1Id) : null;
+     const anchorPos = anchorAtom ? anchorAtom.position : (updatedBond.atom1Position || removedAtom?.position);
+     if (anchorPos && updatedBond.atom2Position) {
+       const dx = updatedBond.atom2Position.x - anchorPos.x;
+       const dy = updatedBond.atom2Position.y - anchorPos.y;
+       const dz = updatedBond.atom2Position.z - anchorPos.z;
+       const currentLen = Math.sqrt(dx * dx + dy * dy + dz * dz);
+       if (currentLen > 0.01) {
+         const scale = targetLength / currentLen;
+         updatedBond.atom2Position = {
+           x: anchorPos.x + dx * scale,
+           y: anchorPos.y + dy * scale,
+           z: anchorPos.z + dz * scale,
+         };
+       }
+     }
+     return updatedBond;
+   }
+   return bond;
  });
  // 保留所有键，即使两端都为空头（表示未完成的键）
  const newMolecule = updateMoleculeProperties({ ...state.molecule, atoms: newAtoms, bonds: newBonds });
@@ -302,18 +343,45 @@ function moleculeReducer(state: MoleculeState, action: MoleculeAction): Molecule
 
  const newBonds = state.molecule.bonds.map(b => {
  if (b.id === action.payload.bondId) {
- const updatedBond: Bond = {
- ...b,
- };
- // 根据 endpoint 更新 atomId，清除对应的 Position
- if (action.payload.endpoint === 'atom1') {
- updatedBond.atom1Id = action.payload.atomId;
- updatedBond.atom1Position = undefined;
- } else {
- updatedBond.atom2Id = action.payload.atomId;
- updatedBond.atom2Position = undefined;
- }
- return updatedBond;
+   const updatedBond: Bond = {
+     ...b,
+   };
+   // 根据 endpoint 更新 atomId，清除对应的 Position
+   if (action.payload.endpoint === 'atom1') {
+     updatedBond.atom1Id = action.payload.atomId;
+     updatedBond.atom1Position = undefined;
+   } else {
+     updatedBond.atom2Id = action.payload.atomId;
+     updatedBond.atom2Position = undefined;
+   }
+   // 键长规则：空键变单头后，调整另一端空头端点的键长
+   // 如果另一端也是空头，需要按单头键规则（原子-C键长）调整
+   const otherEndAtom = updatedBond.atom1Id ? state.molecule.atoms.find(a => a.id === updatedBond.atom1Id) :
+                        updatedBond.atom2Id ? state.molecule.atoms.find(a => a.id === updatedBond.atom2Id) : null;
+   const otherEmptyPos = updatedBond.atom1Id === null ? updatedBond.atom1Position :
+                         updatedBond.atom2Id === null ? updatedBond.atom2Position : undefined;
+   if (otherEndAtom && otherEmptyPos) {
+     // 单头键：用原子-C键长
+     const targetLength = getBondLengthForState(updatedBond, state.molecule.atoms);
+     const dx = otherEmptyPos.x - otherEndAtom.position.x;
+     const dy = otherEmptyPos.y - otherEndAtom.position.y;
+     const dz = otherEmptyPos.z - otherEndAtom.position.z;
+     const currentLen = Math.sqrt(dx * dx + dy * dy + dz * dz);
+     if (currentLen > 0.01) {
+       const scale = targetLength / currentLen;
+       const newPos = {
+         x: otherEndAtom.position.x + dx * scale,
+         y: otherEndAtom.position.y + dy * scale,
+         z: otherEndAtom.position.z + dz * scale,
+       };
+       if (updatedBond.atom1Id === null) {
+         updatedBond.atom1Position = newPos;
+       } else {
+         updatedBond.atom2Position = newPos;
+       }
+     }
+   }
+   return updatedBond;
  }
  return b;
  });

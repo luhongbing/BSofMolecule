@@ -891,6 +891,22 @@ export function createMesityleneMolecule(): Molecule {
   addMethylGroup(atoms[2].position, cRingIds[2], (2 / 6) * 2 * Math.PI);
   addMethylGroup(atoms[4].position, cRingIds[4], (4 / 6) * 2 * Math.PI);
 
+  // 在环碳 1, 3, 5 位添加 H 原子（指环外侧）
+  for (const idx of [1, 3, 5]) {
+    const angle = (idx / 6) * 2 * Math.PI;
+    const hId = generateUUID();
+    atoms.push({
+      id: hId, symbol: 'H',
+      position: {
+        x: hexRadius * Math.cos(angle) + chBondLength * Math.cos(angle),
+        y: hexRadius * Math.sin(angle) + chBondLength * Math.sin(angle),
+        z: 0
+      },
+      atomicNumber: 1, color: getElementColor('H')
+    });
+    bonds.push({ id: generateUUID(), atom1Id: cRingIds[idx], atom2Id: hId, order: 1 });
+  }
+
   return { atoms, bonds };
 }
 
