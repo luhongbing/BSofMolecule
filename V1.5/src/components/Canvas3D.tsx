@@ -3762,7 +3762,25 @@ export function Canvas3D() {
           
           // 识别约束基团，判断是否可以绕键旋转
           {
-            const groupInfo = identifyConstrainedGroup(clickedAtomId, newSelectedAtoms);
+            // 点击H原子时，使用其连接的重原子作为旋转分析起点
+            let rotationStartAtomId = clickedAtomId;
+            if (newSelectedAtoms.length === 1) {
+              const clickedAtom = stateRef.current.molecule.atoms.find(a => a.id === clickedAtomId);
+              if (clickedAtom && clickedAtom.symbol === 'H') {
+                const hBond = stateRef.current.molecule.bonds.find(
+                  b => (b.atom1Id === clickedAtomId && b.atom2Id !== null) ||
+                       (b.atom2Id === clickedAtomId && b.atom1Id !== null)
+                );
+                if (hBond) {
+                  const heavyId = hBond.atom1Id === clickedAtomId ? hBond.atom2Id! : hBond.atom1Id!;
+                  const heavyAtom = stateRef.current.molecule.atoms.find(a => a.id === heavyId);
+                  if (heavyAtom && heavyAtom.symbol !== 'H') {
+                    rotationStartAtomId = heavyId;
+                  }
+                }
+              }
+            }
+            const groupInfo = identifyConstrainedGroup(rotationStartAtomId, newSelectedAtoms);
             interactionRef.current.constrainedAtoms = groupInfo.atoms;
             interactionRef.current.rotationFixedAtomId = groupInfo.fixedAtomId;
             interactionRef.current.rotationAxis = groupInfo.rotationAxis;
@@ -4750,6 +4768,15 @@ export function Canvas3D() {
               // 拼接后刚性约束检查
               validateMolecule(stateRef.current.molecule);
             }, 50);
+          } else {
+          setTimeout(() => {
+            optimizeGeometryAroundAtom(
+              stateRef.current.molecule,
+              snapTargetAtomId,
+              updateAtomPositionRef.current,
+              updateBondPositionRef.current
+            );
+          }, 50);
           }
         }
 
