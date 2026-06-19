@@ -1264,6 +1264,12 @@ function getIdealDirections3D(hybridization: string, count: number): { x: number
       { x: -0.5, y: Math.sqrt(3) / 2, z: 0 },
       { x: -0.5, y: -Math.sqrt(3) / 2, z: 0 },
     ];
+  } else if (hybridization === 'sp2' && count === 2) {
+    // 2个sp2方向：120度间隔
+    return [
+      { x: 1, y: 0, z: 0 },
+      { x: -0.5, y: Math.sqrt(3) / 2, z: 0 },
+    ];
   } else if (hybridization === 'sp' && count === 2) {
     // 直线：180度
     return [
@@ -1397,7 +1403,11 @@ export function computeOptimizedBondPositions(
     hybridization = 'sp3';
   } else if (maxBondOrder === 3) {
     hybridization = 'sp';
+  } else if (totalCount === 2 && maxBondOrder >= 2) {
+    hybridization = 'sp';
   } else if (maxBondOrder === 2) {
+    hybridization = 'sp2';
+  } else if (totalCount === 2) {
     hybridization = 'sp2';
   } else {
     hybridization = 'sp3';
@@ -1641,7 +1651,11 @@ export function optimizeGeometryAroundAtom(
     hybridization = 'sp3';
   } else if (maxBondOrder === 3) {
     hybridization = 'sp';
+  } else if (neighbors.length === 2 && maxBondOrder >= 2) {
+    hybridization = 'sp';
   } else if (maxBondOrder === 2) {
+    hybridization = 'sp2';
+  } else if (neighbors.length === 2) {
     hybridization = 'sp2';
   } else {
     hybridization = 'sp3';
@@ -1726,7 +1740,6 @@ export function optimizeGeometryAroundAtom(
   // 非sp3或sp3+2+可移动邻居：使用贪心匹配+旋转方法
   const idealDirs = getIdealDirections3D(hybridization, neighbors.length);
   if (idealDirs.length !== neighbors.length) return;
-  if (neighbors.length === 2) return;
 
   // 贪心匹配：为每个邻居找最佳匹配的理想方向（按点积最大匹配）
   const matched = new Set<number>(); // 已被匹配的ideal方向索引
@@ -1995,6 +2008,8 @@ export function calculateIdealBondDirection(
     hybridization = 'sp3';
   } else if (maxBondOrder === 3) {
     hybridization = 'sp';
+  } else if (totalCount === 2 && maxBondOrder >= 2) {
+    hybridization = 'sp';
   } else if (maxBondOrder === 2) {
     hybridization = 'sp2';
   } else {
@@ -2010,6 +2025,28 @@ export function calculateIdealBondDirection(
     // sp杂化：新键与第一个键共线（反方向）
     const existing = existingDirs[0];
     return { x: -existing.x, y: -existing.y, z: -existing.z };
+  }
+
+  if ((hybridization === 'sp2' || hybridization === 'sp3') && totalCount === 2) {
+    // 2个键：120°间隔（sp2或sp3都按120°处理）
+    const v1 = existingDirs[0];
+    // 选一个与v1不平行的向量
+    const perp = Math.abs(v1.x) < 0.9 ? { x: 1, y: 0, z: 0 } : { x: 0, y: 1, z: 0 };
+    // 叉积得到旋转轴（垂直于v1）
+    const axisX = v1.y * perp.z - v1.z * perp.y;
+    const axisY = v1.z * perp.x - v1.x * perp.z;
+    const axisZ = v1.x * perp.y - v1.y * perp.x;
+    const axisLen = Math.sqrt(axisX * axisX + axisY * axisY + axisZ * axisZ);
+    if (axisLen < 0.001) return { x: 1, y: 0, z: 0 };
+    const ax = { x: axisX / axisLen, y: axisY / axisLen, z: axisZ / axisLen };
+    // Rodrigues 旋转120°
+    const cos120 = -0.5;
+    const sin120 = Math.sqrt(3) / 2;
+    const dot = v1.x * ax.x + v1.y * ax.y + v1.z * ax.z;
+    const rx = v1.x * cos120 + (ax.y * v1.z - ax.z * v1.y) * sin120 + ax.x * dot * (1 - cos120);
+    const ry = v1.y * cos120 + (ax.z * v1.x - ax.x * v1.z) * sin120 + ax.y * dot * (1 - cos120);
+    const rz = v1.z * cos120 + (ax.x * v1.y - ax.y * v1.x) * sin120 + ax.z * dot * (1 - cos120);
+    return { x: rx, y: ry, z: rz };
   }
 
   if (hybridization === 'sp2' && totalCount === 3) {
@@ -2032,22 +2069,6 @@ export function calculateIdealBondDirection(
     const crossX = v1.y * v2.z - v1.z * v2.y;
     const crossY = v1.z * v2.x - v1.x * v2.z;
     const crossZ = v1.x * v2.y - v1.y * v2.x;
-    const crossLen = Math.sqrt(crossX * crossX + crossY * crossY + crossZ * crossZ);
-    if (crossLen > 0.001) {
-      return { x: crossX / crossLen, y: crossY / crossLen, z: crossZ / crossLen };
-    }
-    return { x: 1, y: 0, z: 0 };
-  }
-
-  if (hybridization === 'sp3' && totalCount === 2) {
-    // sp3杂化 + 2个键：新键与第一个键呈109.5°（或反方向）
-    // 简化：取与第一个键的垂直方向作为新键
-    const v1 = existingDirs[0];
-    const perp = Math.abs(v1.x) < 0.9 ? { x: 1, y: 0, z: 0 } : { x: 0, y: 1, z: 0 };
-    // 叉积
-    const crossX = v1.y * perp.z - v1.z * perp.y;
-    const crossY = v1.z * perp.x - v1.x * perp.z;
-    const crossZ = v1.x * perp.y - v1.y * perp.x;
     const crossLen = Math.sqrt(crossX * crossX + crossY * crossY + crossZ * crossZ);
     if (crossLen > 0.001) {
       return { x: crossX / crossLen, y: crossY / crossLen, z: crossZ / crossLen };

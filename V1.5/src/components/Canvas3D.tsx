@@ -5464,13 +5464,22 @@ export function Canvas3D() {
     window.addEventListener('resize', handleResize);
 
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
       if (event.key === 'Delete' || event.key === 'Backspace') {
-        if (stateRef.current.selectedBond) {
-          removeBondRef.current(stateRef.current.selectedBond);
-          selectBondRef.current(null);
-        } else if (stateRef.current.selectedAtom) {
+        event.preventDefault();
+        if (stateRef.current.selectedAtom) {
           removeAtomRef.current(stateRef.current.selectedAtom);
           selectAtomRef.current(null);
+          setGyroSelectedAtomId(null);
+        } else if (stateRef.current.selectedBond) {
+          removeBondRef.current(stateRef.current.selectedBond);
+          selectBondRef.current(null);
+          setGyroSelectedAtomId(null);
+        } else if (stateRef.current.selectedAtoms.length > 0) {
+          stateRef.current.selectedAtoms.forEach(id => removeAtomRef.current(id));
+          selectAtomRef.current(null);
+          setGyroSelectedAtomId(null);
+          updateSelectedAtomsRef.current([]);
         }
       } else if (event.key === 'Escape') {
         selectAtomRef.current(null);

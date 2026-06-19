@@ -918,7 +918,8 @@ export function Toolbar() {
               </button>
             </div>
 
-            <div className="flex items-center gap-1 border-l border-gray-600 pl-4">
+            <div className="w-px h-6 bg-gray-600"></div>
+            <div className="flex items-center gap-1">
               {ATOMS.map((atom) => (
                 <button
                   key={atom.symbol}
@@ -1059,7 +1060,8 @@ export function Toolbar() {
             
             {/* 删除和清理按钮 - 放在最右侧 */}
             <div className="flex-1"></div>
-            <div className="flex items-center gap-1 border-l border-gray-600 pl-4">
+            <div className="w-px h-6 bg-gray-600"></div>
+            <div className="flex items-center gap-1">
               <button
                 onClick={() => {
                   if (state.selectedAtom) {
