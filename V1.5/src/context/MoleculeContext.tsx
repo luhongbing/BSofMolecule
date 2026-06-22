@@ -4,6 +4,7 @@ export type { Atom } from '../types';
 import { generateUUID, calculateMolecularWeight, calculateFormula, calculateUnsaturation, analyzeHybridization, findAllCollinearGroups, findAllCoplanarGroups, getElementColor, validateMolecule, printValidationResult, hasFreeValence, getAvailableValence, getBondLengthForState } from '../utils/chemistry';
 import { createMethaneMolecule } from '../utils/molecules';
 import { getFunctionalGroupById } from '../utils/functionalGroups';
+import { getElement, ELEMENTS_SET } from '../utils/elements';
 
 const INITIAL_MOLECULE: Molecule = {
  atoms: [],
@@ -133,7 +134,7 @@ const initialState: MoleculeState = {
  insertAtomSymbol: null,
   insertBondOrder: null,
   insertFunctionalGroupId: null,
- analysisResult: { collinearGroups: [], coplanarGroups: [], hybridization: { sp: [], sp2: [], sp3: [] } },
+ analysisResult: { collinearGroups: [], coplanarGroups: [], hybridization: { sp: [], sp2: [], sp3: [], sp3d: [], sp3d2: [], sp3d3: [] } },
  validationResult: { isValid: true, issues: [] },
  cameraSpherical: { theta: 0, phi: Math.PI / 2, radius: 20 },
  zoomLevel: 100,
@@ -434,7 +435,7 @@ function moleculeReducer(state: MoleculeState, action: MoleculeAction): Molecule
  return {
  ...state,
  molecule: INITIAL_MOLECULE,
- analysisResult: { collinearGroups: [], coplanarGroups: [], hybridization: { sp: [], sp2: [], sp3: [] } },
+ analysisResult: { collinearGroups: [], coplanarGroups: [], hybridization: { sp: [], sp2: [], sp3: [], sp3d: [], sp3d2: [], sp3d3: [] } },
  validationResult: { isValid: true, issues: [] },
  selectedAtom: null,
  selectedBond: null,
@@ -525,10 +526,7 @@ function moleculeReducer(state: MoleculeState, action: MoleculeAction): Molecule
  }
 }
 function getAtomicNumber(symbol: string): number {
- const numbers: Record<string, number> = {
- H: 1, C: 6, N: 7, O: 8, F: 9, Cl: 17, Br: 35, I: 53, S: 16, P: 15
- };
- return numbers[symbol] || 6;
+  return ELEMENTS_SET.has(symbol) ? getElement(symbol)!.atomicNumber : 6;
 }
 function getCovalentRadius(symbol: string): number {
  const radii: Record<string, number> = {

@@ -744,8 +744,6 @@ export function Toolbar() {
                     placeholder="SMILES / 分子名"
                     className="px-3 py-1.5 pr-8 bg-gray-700 rounded-lg text-sm w-72 focus:outline-none focus:ring-2 focus:ring-blue-500"
                   />
-                  {/* 搜索按钮左侧分割线 */}
-                  <div className="absolute right-7 top-1/2 -translate-y-1/2 w-px h-4 bg-gray-600"></div>
                   <button
                     onClick={() => {
                       handleSearch();

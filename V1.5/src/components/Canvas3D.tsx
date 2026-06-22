@@ -4802,8 +4802,49 @@ export function Canvas3D() {
 
         if (intersection) {
           const targetPos = { x: intersection.x, y: intersection.y, z: intersection.z };
-          const safePos = calculateSafeAtomPosition(draggedAtomRef.current, targetPos);
-          addAtomRef.current(draggedAtomRef.current, safePos);
+          const symbol = draggedAtomRef.current;
+
+          // 检查附近是否有空闲价态的原子 → 自动成键
+          const nearbyResult = findNearbyAtomWithFreeValence(targetPos, stateRef.current.molecule);
+
+          if (nearbyResult.canSnap && nearbyResult.targetAtomId) {
+            const targetAtom = stateRef.current.molecule.atoms.find(a => a.id === nearbyResult.targetAtomId);
+            if (targetAtom) {
+              const bondLen = getStandardBondLength(symbol, targetAtom.symbol, 1);
+              const idealDir = calculateIdealBondDirection(stateRef.current.molecule, targetAtom.id);
+              if (idealDir) {
+                const newPos = {
+                  x: targetAtom.position.x + idealDir.x * bondLen,
+                  y: targetAtom.position.y + idealDir.y * bondLen,
+                  z: targetAtom.position.z + idealDir.z * bondLen,
+                };
+                addAtomRef.current(symbol, newPos);
+                // 等atom state更新后再创建键
+                setTimeout(() => {
+                  const atoms = stateRef.current.molecule.atoms;
+                  const newAtom = atoms[atoms.length - 1];
+                  if (newAtom) {
+                    addBondRef.current(targetAtom.id, newAtom.id, 1);
+                    // 优化键角键长
+                    setTimeout(() => {
+                      optimizeGeometryAroundAtom(
+                        stateRef.current.molecule, targetAtom.id,
+                        updateAtomPositionRef.current, updateBondPositionRef.current
+                      );
+                      optimizeGeometryAroundAtom(
+                        stateRef.current.molecule, newAtom.id,
+                        updateAtomPositionRef.current, updateBondPositionRef.current
+                      );
+                      validateMolecule(stateRef.current.molecule);
+                    }, 50);
+                  }
+                }, 50);
+              }
+            }
+          } else {
+            const safePos = calculateSafeAtomPosition(symbol, targetPos);
+            addAtomRef.current(symbol, safePos);
+          }
         }
         clearDragRef.current();
       } else if (draggedBondOrderRef.current && bondStartAtomRef.current) {

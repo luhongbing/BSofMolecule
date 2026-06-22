@@ -2146,7 +2146,7 @@ function buildStructuralUnit(
   parsedBonds: { a1: number; a2: number; order: number }[],
   atomPositions: Map<string, { x: number; y: number; z: number }>,
   offset: { x: number; y: number; z: number },
-  hybridizationMap?: Map<string, 'sp' | 'sp2' | 'sp3'>
+  hybridizationMap?: Map<string, 'sp' | 'sp2' | 'sp3' | 'sp3d' | 'sp3d2' | 'sp3d3'>
 ) {
   switch (unit.type) {
     case 'aromatic_ring':
@@ -2307,7 +2307,7 @@ function attachUnitToExisting(
   parsedAtoms: ParsedAtom[],
   parsedBonds: { a1: number; a2: number; order: number }[],
   atomPositions: Map<string, { x: number; y: number; z: number }>,
-  hybridizationMap?: Map<string, 'sp' | 'sp2' | 'sp3'>
+  hybridizationMap?: Map<string, 'sp' | 'sp2' | 'sp3' | 'sp3d' | 'sp3d2' | 'sp3d3'>
 ) {
   const attachAtom = parsedAtoms[attachAtomIdx];
   
@@ -2449,7 +2449,7 @@ function buildLinearChain(
   parsedBonds: { a1: number; a2: number; order: number }[],
   atomPositions: Map<string, { x: number; y: number; z: number }>,
   fragmentOffset: number,
-  hybridizationMap?: Map<string, 'sp' | 'sp2' | 'sp3'>
+  hybridizationMap?: Map<string, 'sp' | 'sp2' | 'sp3' | 'sp3d' | 'sp3d2' | 'sp3d3'>
 ) {
   if (fragment.length === 0) return;
   
@@ -2755,7 +2755,7 @@ function generate3DCoordinates(
     bondOrders.get(a2Id)!.set(a1Id, b.order);
   });
 
-  const hybridizationMap = new Map<string, 'sp' | 'sp2' | 'sp3'>();
+  const hybridizationMap = new Map<string, 'sp' | 'sp2' | 'sp3' | 'sp3d' | 'sp3d2' | 'sp3d3'>();
   parsedAtoms.forEach((pa) => {
     const hyb = getHybridization(pa, bondOrders);
     hybridizationMap.set(pa.id, hyb);
@@ -3694,7 +3694,7 @@ function generate3DCoordinates(
               }
             }
             
-            const availableDirs = getAvailableDirections(conn1.outsidePos, connExistingPositions, connHyb as 'sp' | 'sp2' | 'sp3');
+            const availableDirs = getAvailableDirections(conn1.outsidePos, connExistingPositions, connHyb as 'sp' | 'sp2' | 'sp3' | 'sp3d' | 'sp3d2' | 'sp3d3');
             const bestDirIdx = chooseBestDirection(conn1.outsidePos, availableDirs, bondLen1, [parsedAtoms[conn1.outsideIdx].id]);
             const molDir = availableDirs[bestDirIdx] || { x: 1, y: 0, z: 0 };
             
@@ -4328,7 +4328,7 @@ function generate3DCoordinates(
   function getAvailableDirections(
     currentPos: { x: number, y: number, z: number },
     existingNeighborPositions: { x: number, y: number, z: number }[],
-    hyb: 'sp' | 'sp2' | 'sp3'
+    hyb: 'sp' | 'sp2' | 'sp3' | 'sp3d' | 'sp3d2' | 'sp3d3'
   ): { x: number, y: number, z: number }[] {
     const directions: { x: number, y: number, z: number }[] = [];
     const cos109 = -1 / 3;
@@ -4339,6 +4339,16 @@ function generate3DCoordinates(
     // sp3 使用真正的3D四面体几何，不投影到2D
     if (hyb === 'sp3') {
       return getSp3Directions3D(currentPos, existingNeighborPositions);
+    }
+
+    if (hyb === 'sp3d3') {
+      return getSp3d3Directions3D(currentPos, existingNeighborPositions);
+    }
+    if (hyb === 'sp3d2') {
+      return getSp3d2Directions3D(currentPos, existingNeighborPositions);
+    }
+    if (hyb === 'sp3d') {
+      return getSp3dDirections3D(currentPos, existingNeighborPositions);
     }
 
     // sp 使用3D直线形几何（三键）
@@ -4426,6 +4436,137 @@ function generate3DCoordinates(
     // sp杂化最多只能有2个键（三键视为一个键），已有2个邻居时不再添加方向
 
     return directions;
+  }
+
+  function getSp3d3Directions3D(
+    currentPos: { x: number; y: number; z: number },
+    existingNeighborPositions: { x: number; y: number; z: number }[]
+  ): { x: number; y: number; z: number }[] {
+    // 五角双锥：7个方向，5 equatorial 72° + 2 axial 180°
+    const existingDirs = existingNeighborPositions.map(p => {
+      const dx = p.x - currentPos.x;
+      const dy = p.y - currentPos.y;
+      const dz = (p.z || 0) - (currentPos.z || 0);
+      const len = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+      return { x: dx / len, y: dy / len, z: dz / len };
+    });
+
+    const cos72 = Math.cos(2 * Math.PI / 5);
+    const sin72 = Math.sin(2 * Math.PI / 5);
+    const cos144 = Math.cos(4 * Math.PI / 5);
+    const sin144 = Math.sin(4 * Math.PI / 5);
+
+    const allIdeal: { x: number; y: number; z: number }[] = [
+      { x: 0, y: 0, z: 1 },
+      { x: 0, y: 0, z: -1 },
+      { x: 1, y: 0, z: 0 },
+      { x: cos72, y: sin72, z: 0 },
+      { x: cos144, y: sin144, z: 0 },
+      { x: cos144, y: -sin144, z: 0 },
+      { x: cos72, y: -sin72, z: 0 },
+    ];
+
+    // 贪心匹配
+    const matched = new Set<number>();
+    for (const dir of existingDirs) {
+      let bestIdx = -1;
+      let bestDot = -Infinity;
+      for (let ii = 0; ii < allIdeal.length; ii++) {
+        if (matched.has(ii)) continue;
+        const dot = dir.x * allIdeal[ii].x + dir.y * allIdeal[ii].y + dir.z * allIdeal[ii].z;
+        if (dot > bestDot) { bestDot = dot; bestIdx = ii; }
+      }
+      if (bestIdx >= 0) matched.add(bestIdx);
+    }
+
+    const result: { x: number; y: number; z: number }[] = [];
+    for (let ii = 0; ii < allIdeal.length; ii++) {
+      if (!matched.has(ii)) result.push(allIdeal[ii]);
+    }
+    return result;
+  }
+
+  function getSp3d2Directions3D(
+    currentPos: { x: number; y: number; z: number },
+    existingNeighborPositions: { x: number; y: number; z: number }[]
+  ): { x: number; y: number; z: number }[] {
+    const existingDirs = existingNeighborPositions.map(p => {
+      const dx = p.x - currentPos.x;
+      const dy = p.y - currentPos.y;
+      const dz = (p.z || 0) - (currentPos.z || 0);
+      const len = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+      return { x: dx / len, y: dy / len, z: dz / len };
+    });
+
+    // 正八面体：6个方向，±X, ±Y, ±Z
+    const allIdeal: { x: number; y: number; z: number }[] = [
+      { x: 1, y: 0, z: 0 },
+      { x: -1, y: 0, z: 0 },
+      { x: 0, y: 1, z: 0 },
+      { x: 0, y: -1, z: 0 },
+      { x: 0, y: 0, z: 1 },
+      { x: 0, y: 0, z: -1 },
+    ];
+
+    // 贪心匹配
+    const matched = new Set<number>();
+    for (const dir of existingDirs) {
+      let bestIdx = -1;
+      let bestDot = -Infinity;
+      for (let ii = 0; ii < allIdeal.length; ii++) {
+        if (matched.has(ii)) continue;
+        const dot = dir.x * allIdeal[ii].x + dir.y * allIdeal[ii].y + dir.z * allIdeal[ii].z;
+        if (dot > bestDot) { bestDot = dot; bestIdx = ii; }
+      }
+      if (bestIdx >= 0) matched.add(bestIdx);
+    }
+
+    const result: { x: number; y: number; z: number }[] = [];
+    for (let ii = 0; ii < allIdeal.length; ii++) {
+      if (!matched.has(ii)) result.push(allIdeal[ii]);
+    }
+    return result;
+  }
+
+  function getSp3dDirections3D(
+    currentPos: { x: number; y: number; z: number },
+    existingNeighborPositions: { x: number; y: number; z: number }[]
+  ): { x: number; y: number; z: number }[] {
+    const existingDirs = existingNeighborPositions.map(p => {
+      const dx = p.x - currentPos.x;
+      const dy = p.y - currentPos.y;
+      const dz = (p.z || 0) - (currentPos.z || 0);
+      const len = Math.sqrt(dx * dx + dy * dy + dz * dz) || 1;
+      return { x: dx / len, y: dy / len, z: dz / len };
+    });
+
+    // 三角双锥：5个方向，3 equatorial 120° + 2 axial 180°
+    const allIdeal: { x: number; y: number; z: number }[] = [
+      { x: 0, y: 0, z: 1 },
+      { x: 0, y: 0, z: -1 },
+      { x: 1, y: 0, z: 0 },
+      { x: -0.5, y: Math.sqrt(3) / 2, z: 0 },
+      { x: -0.5, y: -Math.sqrt(3) / 2, z: 0 },
+    ];
+
+    // 贪心匹配
+    const matched = new Set<number>();
+    for (const dir of existingDirs) {
+      let bestIdx = -1;
+      let bestDot = -Infinity;
+      for (let ii = 0; ii < allIdeal.length; ii++) {
+        if (matched.has(ii)) continue;
+        const dot = dir.x * allIdeal[ii].x + dir.y * allIdeal[ii].y + dir.z * allIdeal[ii].z;
+        if (dot > bestDot) { bestDot = dot; bestIdx = ii; }
+      }
+      if (bestIdx >= 0) matched.add(bestIdx);
+    }
+
+    const result: { x: number; y: number; z: number }[] = [];
+    for (let ii = 0; ii < allIdeal.length; ii++) {
+      if (!matched.has(ii)) result.push(allIdeal[ii]);
+    }
+    return result;
   }
 
   /** sp3四面体3D方向计算：使用真正的四面体几何，不投影到2D */
@@ -4996,7 +5137,7 @@ function generate3DCoordinates(
           }
         }
         
-        const availableDirs = getAvailableDirections(conn.outsidePos, connExistingPositions, connHyb as 'sp' | 'sp2' | 'sp3');
+        const availableDirs = getAvailableDirections(conn.outsidePos, connExistingPositions, connHyb as 'sp' | 'sp2' | 'sp3' | 'sp3d' | 'sp3d2' | 'sp3d3');
         const bestDirIdx = chooseBestDirection(conn.outsidePos, availableDirs, bondLen, [parsedAtoms[conn.outsideIdx].id]);
         const molDir = availableDirs[bestDirIdx] || { x: 1, y: 0, z: 0 };
         
@@ -5515,7 +5656,7 @@ function findRingDFS(
 function calculateAttachmentDirection(
   fromPos: { x: number; y: number; z: number },
   existingPositions: { x: number; y: number; z: number }[],
-  hyb: 'sp' | 'sp2' | 'sp3'
+  hyb: 'sp' | 'sp2' | 'sp3' | 'sp3d' | 'sp3d2' | 'sp3d3'
 ): { x: number; y: number; z: number } {
   const phi = Math.acos(-1 / 3);
   const cosPhi = Math.cos(phi);
@@ -5577,7 +5718,7 @@ function normalize(v: { x: number; y: number; z: number }): { x: number; y: numb
 function calculateHydrogenDirections(
   parentPos: { x: number; y: number; z: number },
   existingPositions: { positions: { x: number; y: number; z: number }[]; symbols: string[]; orders: number[] },
-  hyb: 'sp' | 'sp2' | 'sp3',
+  hyb: 'sp' | 'sp2' | 'sp3' | 'sp3d' | 'sp3d2' | 'sp3d3',
   cosPhi: number,
   sinPhi: number,
   angleOffset: number = 0,
