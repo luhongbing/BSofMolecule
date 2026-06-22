@@ -2,6 +2,7 @@ import { useRef, useEffect, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { useMolecule } from '../context/MoleculeContext';
 import { useDrag } from '../context/DragContext';
+import { useGyroscope } from '../context/GyroscopeContext';
 import type { Atom } from '../types';
 import { 
   findRigidGroup,
@@ -13,7 +14,9 @@ import {
   getSnappedPosition,
   findNearbyAtomWithFreeValence,
   findNearbyBondEndpoint,
-  optimizeGeometryAroundAtom
+  optimizeGeometryAroundAtom,
+  adjustAtomPreserveSubtree,
+  validateMolecule
 } from '../utils/chemistry';
 import { Gyroscope } from './Gyroscope';
 
@@ -50,7 +53,7 @@ const ELEMENT_RADII: { [key: string]: number } = {
 
 type RotationDirection = 'up' | 'down' | 'left' | 'right' | 'up-left' | 'up-right' | 'down-left' | 'down-right' | null;
 
-export function Canvas3D() {
+export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -163,20 +166,25 @@ export function Canvas3D() {
     clearDrag
   } = useDrag();
 
+  const { showRotation, viewQuaternionRef } = useGyroscope();
+
   const [showLabels, setShowLabels] = useState(true);
   const [isDarkMode, setIsDarkMode] = useState(true);
   const [hoveredObject, setHoveredObject] = useState<{ type: 'atom' | 'bond'; id: string } | null>(null);
 
   const [showReferencePlane, setShowReferencePlane] = useState(false);
-  const [showGyroscopeRotation, setShowGyroscopeRotation] = useState(false);
+  const [showGyroscopeRotation, setShowGyroscopeRotation] = useState(true);
+  const [toolbarCollapsed, setToolbarCollapsed] = useState(false);
   const [gyroscopeResetKey, setGyroscopeResetKey] = useState(0);
   const [gyroSelectedAtomId, setGyroSelectedAtomId] = useState<string | null>(null);
   const { 
     state: { cameraSpherical, zoomLevel }, 
-    setCameraSpherical 
+    setCameraSpherical,
+    setZoomLevel
   } = useMolecule();
   const cameraSphericalRef = useRef(cameraSpherical);
   const zoomLevelRef = useRef(zoomLevel);
+  const setZoomLevelRef = useRef(setZoomLevel);
   const activeDirectionRef = useRef<RotationDirection>(null);
   const referenceLineRef = useRef<THREE.Mesh | null>(null);
   const referencePlaneRef = useRef<THREE.Mesh | null>(null);
@@ -271,10 +279,6 @@ export function Canvas3D() {
   });
 
   const moleculeRotationRef = useRef(new THREE.Quaternion()); // 空白拖拽产生的分子旋转
-
-  // 视角四元数：视角旋转的真实来源，避免欧拉角转换导致晃动
-  // 默认为 identity（不旋转），相机固定在(0,0,20)看向原点，直接看到分子+Z面（南方）
-  const viewQuaternionRef = useRef(new THREE.Quaternion());
 
   // 从 cameraSpherical 计算 viewQuaternion（仅用于方向按钮等需要从theta/phi设置视角的场景）
   const getViewQuaternion = useCallback((theta: number, phi: number): THREE.Quaternion => {
@@ -385,6 +389,11 @@ export function Canvas3D() {
   useEffect(() => {
     zoomLevelRef.current = zoomLevel;
   }, [zoomLevel]);
+
+  // 初始化：同步万向仪显示状态到 Context
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('showGyroRotation', { detail: { show: true } }));
+  }, []);
 
   const updateCameraFromSpherical = useCallback(() => {
     if (!cameraRef.current) return;
@@ -4313,17 +4322,42 @@ export function Canvas3D() {
                   interactionRef.current.snapTargetEndpoint
                 );
                 
-                // 优化键另一端原子周围的几何结构
-                if (otherAtomId) {
-                  setTimeout(() => {
-                    optimizeGeometryAroundAtom(
+                // 拼接方案：公团（A=被拖拽原子）刚体平移到标准键长，母团（B=键另一端）只重排H和空头键
+                const draggedAtomId = atom.id;
+                setTimeout(() => {
+                  if (otherAtomId) {
+                    // 1. 公团A刚体平移：沿B→A方向移动A到标准键长，A的子树同步平移，检测冲突并旋转规避
+                    adjustAtomPreserveSubtree(
                       stateRef.current.molecule,
+                      draggedAtomId,
                       otherAtomId,
                       updateAtomPositionRef.current,
                       updateBondPositionRef.current
                     );
-                  }, 50);
-                }
+                    // 2. 母团B：只重排H和空头键，重原子不动
+                    optimizeGeometryAroundAtom(
+                      stateRef.current.molecule,
+                      otherAtomId,
+                      updateAtomPositionRef.current,
+                      updateBondPositionRef.current,
+                      new Set([draggedAtomId]) // 排除A，A不动
+                    );
+                  } else {
+                    optimizeGeometryAroundAtom(
+                      stateRef.current.molecule,
+                      draggedAtomId,
+                      updateAtomPositionRef.current,
+                      updateBondPositionRef.current
+                    );
+                  }
+                  // 拼接后刚性约束检查日志
+                  const result = validateMolecule(stateRef.current.molecule);
+                  if (result.issues.length > 0) {
+                    result.issues.forEach((issue) => {
+                      console.log(`  [${issue.type}] ${issue.message}`);
+                    });
+                  }
+                }, 50);
               }
             } else if (interactionRef.current.snapTargetAtomId) {
               // 原子靠近有空余化合价的原子：只吸附位置，不自动成键
@@ -4388,23 +4422,56 @@ export function Canvas3D() {
           
           // 如果吸附成功，优化目标原子周围的几何结构
           if (hasAdsorbed) {
-            // 收集需要优化的原子ID
-            const atomsToOptimize = new Set<string>();
+            // 拼接方案：公团（A=键另一端已连接原子）刚体平移，母团（B=吸附目标原子）只重排H和空头键
+            const targetAtoms = new Set<string>(); // B（母团）
             if (interactionRef.current.snapTarget1) {
-              atomsToOptimize.add(interactionRef.current.snapTarget1.atomId);
+              targetAtoms.add(interactionRef.current.snapTarget1.atomId);
             }
             if (interactionRef.current.snapTarget2) {
-              atomsToOptimize.add(interactionRef.current.snapTarget2.atomId);
+              targetAtoms.add(interactionRef.current.snapTarget2.atomId);
             }
-            // 延迟执行几何优化，等状态更新完成
+            const otherAtoms = new Set<string>(); // A（公团）
+            if (bond.atom1Id) otherAtoms.add(bond.atom1Id);
+            if (bond.atom2Id) otherAtoms.add(bond.atom2Id);
             setTimeout(() => {
-              for (const atomId of atomsToOptimize) {
+              // 1. 公团A刚体平移：沿B→A方向移动A到标准键长，检测冲突并旋转规避
+              for (const atomId of otherAtoms) {
+                if (!targetAtoms.has(atomId)) {
+                  let anchorId: string | null = null;
+                  if (interactionRef.current.snapTarget1 && bond.atom1Id === atomId) {
+                    anchorId = interactionRef.current.snapTarget1.atomId;
+                  } else if (interactionRef.current.snapTarget2 && bond.atom2Id === atomId) {
+                    anchorId = interactionRef.current.snapTarget2.atomId;
+                  } else {
+                    anchorId = targetAtoms.values().next().value || null;
+                  }
+                  if (anchorId) {
+                    adjustAtomPreserveSubtree(
+                      stateRef.current.molecule,
+                      atomId,
+                      anchorId,
+                      updateAtomPositionRef.current,
+                      updateBondPositionRef.current
+                    );
+                  }
+                }
+              }
+              // 2. 母团B：只重排H和空头键，重原子不动
+              for (const atomId of targetAtoms) {
                 optimizeGeometryAroundAtom(
                   stateRef.current.molecule,
                   atomId,
                   updateAtomPositionRef.current,
-                  updateBondPositionRef.current
+                  updateBondPositionRef.current,
+                  otherAtoms // 排除A，A不动
                 );
+              }
+              // 拼接后刚性约束检查日志
+              const result = validateMolecule(stateRef.current.molecule);
+              if (result.issues.length > 0) {
+                result.issues.forEach((issue) => {
+                  console.log(`  [${issue.type}] ${issue.message}`);
+                });
               }
             }, 50);
           }
@@ -4463,6 +4530,9 @@ export function Canvas3D() {
       interactionRef.current.bondEndpointIsDragging = false;
     };
 
+    let lastPinchDist = 0;
+    let lastPinchCenter = { x: 0, y: 0 };
+
     const onTouchStart = (e: TouchEvent) => {
       e.preventDefault();
 
@@ -4472,8 +4542,16 @@ export function Canvas3D() {
           clientX: touch.clientX,
           clientY: touch.clientY
         } as MouseEvent);
+      } else if (e.touches.length === 2) {
+        // 双指开始，记录初始距离和中心点
+        const dx = e.touches[0].clientX - e.touches[1].clientX;
+        const dy = e.touches[0].clientY - e.touches[1].clientY;
+        lastPinchDist = Math.sqrt(dx * dx + dy * dy);
+        lastPinchCenter = {
+          x: (e.touches[0].clientX + e.touches[1].clientX) / 2,
+          y: (e.touches[0].clientY + e.touches[1].clientY) / 2,
+        };
       }
-      // 双指触摸不做特殊处理，完全由 wheel 事件处理
     };
 
     const onTouchMove = (e: TouchEvent) => {
@@ -4485,8 +4563,42 @@ export function Canvas3D() {
           clientX: touch.clientX,
           clientY: touch.clientY
         } as MouseEvent);
+      } else if (e.touches.length === 2 && lastPinchDist > 0) {
+        // 双指中心移动 = 旋转视角
+        const cx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+        const cy = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+        const deltaX = cx - lastPinchCenter.x;
+        const deltaY = cy - lastPinchCenter.y;
+
+        if (cameraRef.current && groupRef.current) {
+          const sensitivity = 0.008;
+          const quatY = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -deltaX * sensitivity);
+          const quatX = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -deltaY * sensitivity);
+          
+          const viewOld = viewQuaternionRef.current.clone();
+          viewQuaternionRef.current.premultiply(quatY);
+          viewQuaternionRef.current.premultiply(quatX);
+          
+          const quatYInv = quatY.clone().invert();
+          const quatYInv2 = quatYInv.clone().multiply(quatYInv);
+          const compensation = viewOld.clone().invert().multiply(quatYInv2).multiply(viewOld);
+          moleculeRotationRef.current.copy(compensation.multiply(moleculeRotationRef.current.clone()));
+          
+          syncViewToSpherical();
+          updateGroupQuaternion();
+        }
+        lastPinchCenter = { x: cx, y: cy };
+
+        // 双指捏合缩放
+        const dx = e.touches[0].clientX - e.touches[1].clientX;
+        const dy = e.touches[0].clientY - e.touches[1].clientY;
+        const currentDist = Math.sqrt(dx * dx + dy * dy);
+        const scale = currentDist / lastPinchDist;
+        const zoomDelta = (1 - scale) * 50;
+        const newZoom = Math.max(20, Math.min(300, zoomLevelRef.current + zoomDelta));
+        setZoomLevelRef.current(newZoom);
+        lastPinchDist = currentDist;
       }
-      // 双指触摸移动完全由 wheel 事件处理，避免冲突
     };
 
     const onTouchEnd = (e: TouchEvent) => {
@@ -4501,11 +4613,19 @@ export function Canvas3D() {
       }
     };
 
-    // 添加 wheel 事件支持 - 用于笔记本电脑触摸板双指滑动
+    // 添加 wheel 事件支持 - 用于笔记本电脑触摸板双指滑动/缩放
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
       
-      if (e.ctrlKey || interactionRef.current.isDragging) return;
+      if (interactionRef.current.isDragging) return;
+      
+      if (e.ctrlKey) {
+        // 触摸板捏合缩放（ctrlKey + wheel）
+        const zoomDelta = -e.deltaY * 0.1;
+        const newZoom = Math.max(20, Math.min(300, zoomLevelRef.current + zoomDelta));
+        setZoomLevelRef.current(newZoom);
+        return;
+      }
       
       if (cameraRef.current && groupRef.current) {
         // 限制 delta 值，防止跳变
@@ -4619,13 +4739,20 @@ export function Canvas3D() {
 
   // 分离的useEffect 2: 更新分子显示（状态变化时调用，不重新创建场景）
   useEffect(() => {
-    if (!groupRef.current) return;
     updateMoleculeDisplay();
   }, [state.molecule, state.selectedAtom, state.selectedBond, state.selectedAtoms, showLabels, updateMoleculeDisplay]);
 
   useEffect(() => {
-    setShowGyroscopeRotation(false);
+    window.dispatchEvent(new CustomEvent('selectAtom', { detail: { atomId: gyroSelectedAtomId } }));
+  }, [gyroSelectedAtomId]);
+
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('moleculeChange', { detail: { atoms: state.molecule.atoms } }));
   }, [state.molecule]);
+
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('darkModeChange', { detail: { isDarkMode } }));
+  }, [isDarkMode]);
 
   // 监听 cameraSpherical 变化并更新相机位置
   useEffect(() => {
@@ -4664,8 +4791,10 @@ export function Canvas3D() {
     }
     updateCameraFromSpherical();
     stopRotationAnimation();
-    setShowGyroscopeRotation(false);
     setGyroscopeResetKey(k => k + 1);
+    window.dispatchEvent(new CustomEvent('resetGyro'));
+    // 恢复100%缩放
+    setZoomLevel(100);
   };
 
   // 切换视角到指定方向
@@ -4720,8 +4849,19 @@ export function Canvas3D() {
     updateGroupQuaternion();
     updateCameraFromSpherical();
     stopRotationAnimation();
-    setShowGyroscopeRotation(false);
   };
+
+  // 监听万向仪方向按钮事件
+  useEffect(() => {
+    const handleViewDirEvent = (e: Event) => {
+      const direction = (e as CustomEvent).detail as 'east' | 'west' | 'up' | 'down' | 'south' | 'north';
+      handleViewDirection(direction);
+    };
+    window.addEventListener('viewDirection', handleViewDirEvent);
+    return () => {
+      window.removeEventListener('viewDirection', handleViewDirEvent);
+    };
+  }, []);
 
   const resetGroupRotation = () => {
     if (!groupRef.current || !state.molecule.atoms.length) return;
@@ -4753,50 +4893,76 @@ export function Canvas3D() {
         </div>
       )}
 
-      {/* 控制按钮 - 左侧 */}
-      <div className="absolute top-4 left-4 flex flex-col gap-2">
+      {/* 控制按钮组 - 左侧 */}
+      <div className="absolute flex flex-col gap-1" style={{ top: `${toolbarHeight + 28}px`, left: 'max(0.5rem, env(safe-area-inset-left, 0.5rem))' }}>
+        <div className="flex flex-col rounded-lg overflow-hidden">
+          <button
+            onClick={resetView}
+            className="bg-gray-800/80 hover:bg-gray-700/80 text-white transition-colors flex items-center justify-center"
+            title="重置视角"
+            style={{ width: '42px', height: '42px', fontSize: '18px' }}
+          >
+            ◎
+          </button>
+          {!toolbarCollapsed && (
+            <>
+              <button
+                onClick={() => setShowLabels(!showLabels)}
+                className={`bg-gray-800/80 hover:bg-gray-700/80 transition-colors flex items-center justify-center text-lg ${
+                  showLabels ? 'text-blue-600' : 'text-white'
+                }`}
+                title={showLabels ? '隐藏标签' : '显示标签'}
+                style={{ width: '42px', height: '42px' }}
+              >
+                <span style={{ fontSize: '18px' }}>③</span>
+              </button>
+              <button
+                onClick={() => setIsDarkMode(!isDarkMode)}
+                className={`bg-gray-800/80 hover:bg-gray-700/80 transition-colors flex items-center justify-center ${
+                  isDarkMode ? 'text-white' : 'text-yellow-400'
+                }`}
+                title={isDarkMode ? '浅色模式' : '深色模式'}
+                style={{ width: '42px', height: '42px', fontSize: '18px' }}
+              >
+                {isDarkMode ? (
+                  <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor" stroke="none">
+                    <circle cx="8" cy="8" r="6" />
+                  </svg>
+                ) : (
+                  <svg width="18" height="18" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+                    <circle cx="8" cy="8" r="5" />
+                    <line x1="8" y1="1" x2="8" y2="3" />
+                    <line x1="8" y1="13" x2="8" y2="15" />
+                    <line x1="1" y1="8" x2="3" y2="8" />
+                    <line x1="13" y1="8" x2="15" y2="8" />
+                  </svg>
+                )}
+              </button>
+              <button
+                onClick={() => {
+                  window.dispatchEvent(new CustomEvent('showGyroRotation', { detail: { show: !showRotation } }));
+                }}
+                className={`bg-gray-800/80 hover:bg-gray-700/80 transition-colors flex items-center justify-center ${
+                  showRotation ? 'text-blue-600' : 'text-white'
+                }`}
+                title="万向仪"
+                style={{ width: '42px', height: '42px', fontSize: '22px' }}
+              >
+                ⌖
+              </button>
+            </>
+          )}
+        </div>
+        {/* 折叠/展开按钮 */}
         <button
-          onClick={resetView}
-          className="px-3 py-2 bg-gray-800/80 hover:bg-gray-700 text-white rounded-lg text-sm transition-colors"
+          onClick={() => setToolbarCollapsed(!toolbarCollapsed)}
+          className="bg-gray-800/80 hover:bg-gray-700 text-white transition-colors flex items-center justify-center"
+          title={toolbarCollapsed ? '展开工具栏' : '收起工具栏'}
+          style={{ width: '42px', height: '16px', fontSize: '10px', borderRadius: '0 0 6px 6px' }}
         >
-          重置视角
-        </button>
-        <button
-          onClick={() => setShowLabels(!showLabels)}
-          className={`px-3 py-2 text-white rounded-lg text-sm transition-colors ${
-            showLabels ? 'bg-blue-600 hover:bg-blue-500' : 'bg-gray-800/80 hover:bg-gray-700'
-          }`}
-        >
-          {showLabels ? '隐藏标签' : '显示标签'}
-        </button>
-        <button
-          onClick={() => setIsDarkMode(!isDarkMode)}
-          className={`px-3 py-2 text-white rounded-lg text-sm transition-colors ${
-            isDarkMode ? 'bg-gray-600 hover:bg-gray-500' : 'bg-gray-800/80 hover:bg-gray-700'
-          }`}
-        >
-          {isDarkMode ? '浅色模式' : '深色模式'}
+          {toolbarCollapsed ? '⋁' : '⋀'}
         </button>
       </div>
-
-      {/* 万向仪 - 左下角 */}
-      <div style={{ position: 'absolute', left: '10px', bottom: '10px' }}>
-        <Gyroscope 
-          sphericalRef={cameraSphericalRef}
-          viewQuaternionRef={viewQuaternionRef}
-          isDarkMode={isDarkMode} 
-          showRotation={showGyroscopeRotation}
-          resetKey={gyroscopeResetKey}
-          onViewDirection={handleViewDirection}
-          selectedAtomId={gyroSelectedAtomId}
-          moleculeAtoms={state.molecule.atoms}
-          moleculeRotationRef={moleculeRotationRef}
-          moleculeGroupRef={groupRef as React.MutableRefObject<THREE.Group | null>}
-        />
-      </div>
-
-
-
 
 
     </div>
