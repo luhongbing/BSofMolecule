@@ -23,7 +23,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
           cache: 'npm'
           cache-dependency-path: 'iOS版/package-lock.json'
 
@@ -37,7 +37,9 @@ jobs:
 
       - name: Sync to iOS
         working-directory: ./iOS版
-        run: npx cap sync ios
+        run: |
+          mkdir -p ios/App/App/public
+          cp -r dist/* ios/App/App/public/
 
       - name: Build iOS Project (Simulator)
         working-directory: ./iOS版/ios/App
