@@ -10,11 +10,11 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
 
     func scene(_ scene: UIScene, openURLContexts URLContexts: Set<UIOpenURLContext>) {
         guard let urlContext = URLContexts.first else { return }
-        ApplicationDelegateProxy.shared.application(UIApplication.shared, open: urlContext.url, options: [:])
+        _ = ApplicationDelegateProxy.shared.application(UIApplication.shared, open: urlContext.url, options: [:])
     }
 
     func scene(_ scene: UIScene, continue userActivity: NSUserActivity) {
-        ApplicationDelegateProxy.shared.application(UIApplication.shared, continue: userActivity, restorationHandler: { _ in })
+        _ = ApplicationDelegateProxy.shared.application(UIApplication.shared, continue: userActivity, restorationHandler: { _ in })
     }
 
     func sceneDidDisconnect(_ scene: UIScene) {
