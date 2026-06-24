@@ -29,9 +29,7 @@ export function SmilesSearchPage({ onClose }: SmilesSearchPageProps) {
     // 再尝试包含匹配 name
     match = PRESET_MOLECULES.find(p => p.name.toLowerCase().includes(trimmed) || trimmed.includes(p.name.toLowerCase()));
     if (match) return match;
-    // 再尝试包含匹配 smiles
-    match = PRESET_MOLECULES.find(p => p.smiles.toLowerCase().includes(trimmed) || trimmed.includes(p.smiles.toLowerCase()));
-    return match || null;
+    return null;
   };
 
   useEffect(() => {

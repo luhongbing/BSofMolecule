@@ -2,7 +2,6 @@ import { useRef, useEffect, useState, useCallback } from 'react';
 import * as THREE from 'three';
 import { useMolecule } from '../context/MoleculeContext';
 import { useDrag } from '../context/DragContext';
-import { useGyroscope } from '../context/GyroscopeContext';
 import type { Atom } from '../types';
 import { 
   findRigidGroup,
@@ -14,6 +13,9 @@ import {
   getSnappedPosition,
   findNearbyAtomWithFreeValence,
   findNearbyBondEndpoint,
+  calculateIdealBondDirection,
+  computeOptimizedBondPositions,
+  getStandardBondLength,
   optimizeGeometryAroundAtom,
   adjustAtomPreserveSubtree,
   validateMolecule
@@ -166,15 +168,13 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
     clearDrag
   } = useDrag();
 
-  const { showRotation, viewQuaternionRef } = useGyroscope();
-
   const [showLabels, setShowLabels] = useState(true);
   const [isDarkMode, setIsDarkMode] = useState(true);
   const [hoveredObject, setHoveredObject] = useState<{ type: 'atom' | 'bond'; id: string } | null>(null);
+  const [toolbarCollapsed, setToolbarCollapsed] = useState(false);
 
   const [showReferencePlane, setShowReferencePlane] = useState(false);
-  const [showGyroscopeRotation, setShowGyroscopeRotation] = useState(true);
-  const [toolbarCollapsed, setToolbarCollapsed] = useState(false);
+  const [showGyroscopeRotation, setShowGyroscopeRotation] = useState(false);
   const [gyroscopeResetKey, setGyroscopeResetKey] = useState(0);
   const [gyroSelectedAtomId, setGyroSelectedAtomId] = useState<string | null>(null);
   const { 
@@ -253,6 +253,9 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
     // 单个原子拖拽
     isSingleAtomDrag: false,
     singleAtomOriginalPosition: { x: 0, y: 0, z: 0 },
+    // 整个连通分量的原始位置（用于回退）
+    singleGroupAtomIds: [] as string[],
+    singleGroupOriginalPositions: {} as Record<string, { x: number; y: number; z: number }>,
     // 单个键拖拽
     isSingleBondDrag: false,
     bondOriginalAtom1Position: { x: 0, y: 0, z: 0 },
@@ -276,9 +279,16 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
     bondEndpointOriginalPosition: { x: 0, y: 0, z: 0 },
     bondEndpointOriginalColor: 0 as number,
     bondEndpointIsDragging: false,
+    // 空头键小球拖拽时的吸附目标原子（屏幕投影重叠检测）
+    endpointSnapTargetAtomId: null as string | null,
+    endpointSnapTargetOriginalColor: 0 as number,
   });
 
   const moleculeRotationRef = useRef(new THREE.Quaternion()); // 空白拖拽产生的分子旋转
+
+  // 视角四元数：视角旋转的真实来源，避免欧拉角转换导致晃动
+  // 默认为 identity（不旋转），相机固定在(0,0,20)看向原点，直接看到分子+Z面（南方）
+  const viewQuaternionRef = useRef(new THREE.Quaternion());
 
   // 从 cameraSpherical 计算 viewQuaternion（仅用于方向按钮等需要从theta/phi设置视角的场景）
   const getViewQuaternion = useCallback((theta: number, phi: number): THREE.Quaternion => {
@@ -389,11 +399,6 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
   useEffect(() => {
     zoomLevelRef.current = zoomLevel;
   }, [zoomLevel]);
-
-  // 初始化：同步万向仪显示状态到 Context
-  useEffect(() => {
-    window.dispatchEvent(new CustomEvent('showGyroRotation', { detail: { show: true } }));
-  }, []);
 
   const updateCameraFromSpherical = useCallback(() => {
     if (!cameraRef.current) return;
@@ -562,6 +567,38 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
     return false; // 无碰撞
   }, []);
   
+  // 检查整个刚性基团是否与其他原子有碰撞
+  const checkRigidGroupCollision = useCallback((
+    groupAtomIds: string[],
+  ): boolean => {
+    const allAtoms = stateRef.current.molecule.atoms;
+    const groupSet = new Set(groupAtomIds);
+    const bondedPairs = new Set<string>();
+    for (const b of stateRef.current.molecule.bonds) {
+      if (b.atom1Id && b.atom2Id) {
+        bondedPairs.add(`${b.atom1Id}-${b.atom2Id}`);
+        bondedPairs.add(`${b.atom2Id}-${b.atom1Id}`);
+      }
+    }
+    for (const idA of groupAtomIds) {
+      const atomA = allAtoms.find(a => a.id === idA);
+      if (!atomA) continue;
+      const radiusA = ELEMENT_RADII[atomA.symbol] || CARBON_RADIUS;
+      for (const otherAtom of allAtoms) {
+        if (groupSet.has(otherAtom.id)) continue;
+        if (bondedPairs.has(`${idA}-${otherAtom.id}`)) continue;
+        const radiusB = ELEMENT_RADII[otherAtom.symbol] || CARBON_RADIUS;
+        const minDist = radiusA + radiusB + 0.2;
+        const dx = atomA.position.x - otherAtom.position.x;
+        const dy = atomA.position.y - otherAtom.position.y;
+        const dz = atomA.position.z - otherAtom.position.z;
+        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+        if (dist < minDist && dist > 0.001) return true;
+      }
+    }
+    return false;
+  }, []);
+
   // 检查单个键的两个原子是否与其他原子重叠
   const checkSingleBondCollision = useCallback((
     bondId: string,
@@ -589,7 +626,7 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
       const dy1 = atom1Pos.y - otherAtom.position.y;
       const dz1 = atom1Pos.z - otherAtom.position.z;
       const dist1 = Math.sqrt(dx1 * dx1 + dy1 * dy1 + dz1 * dz1);
-      if (dist1 < (radius1 + otherRadius) * 0.9) {
+      if (dist1 < radius1 + otherRadius + 0.2) {
         return true;
       }
       
@@ -598,7 +635,7 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
       const dy2 = atom2Pos.y - otherAtom.position.y;
       const dz2 = atom2Pos.z - otherAtom.position.z;
       const dist2 = Math.sqrt(dx2 * dx2 + dy2 * dy2 + dz2 * dz2);
-      if (dist2 < (radius2 + otherRadius) * 0.9) {
+      if (dist2 < radius2 + otherRadius + 0.2) {
         return true;
       }
     }
@@ -2136,9 +2173,6 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
     // 获取所有被选中的原子（优先使用传入的值）
     const selectedAtoms = selectedAtomsOverride ?? stateRef.current.selectedAtoms;
     
-    // 调试：输出传入的参数
-    console.log('[identifyConstrainedGroup] startAtomId:', startAtomId, 'startAtom:', startAtom.symbol, 'selectedAtoms:', selectedAtoms);
-    
     // 注意：不再在此处做双键检查来阻止旋转
     // 双键原子（如苯环碳）仍然可以绕连接它的单键旋转
     // 全局最优键搜索会找到合适的单键作为旋转轴
@@ -2275,32 +2309,36 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
           // 检查是否所有选中原子都在side2
           const allSelectedInSide2 = selectedAtoms.every(id => !side1Atoms.has(id));
           if (allSelectedInSide2) {
-            const side2Size = stateRef.current.molecule.atoms.length - side1Atoms.size;
-            if (side2Size < bestRotateSize) {
-              bestBond = { atom1Id: bond.atom1Id, atom2Id: bond.atom2Id };
-              const side2Atoms = new Set<string>();
-              const visited2 = new Set<string>();
-              const queue2 = [side2Start];
-              visited2.add(side2Start);
-              visited2.add(side1Start);
-              while (queue2.length > 0) {
-                const currentId = queue2.shift()!;
-                side2Atoms.add(currentId);
-                const currentBonds = stateRef.current.molecule.bonds.filter(
-                  b => b.atom1Id === currentId || b.atom2Id === currentId
-                );
-                for (const b of currentBonds) {
-                  const neighborId = b.atom1Id === currentId ? b.atom2Id : b.atom1Id;
-                  if (neighborId === null) continue;
-                  if (!visited2.has(neighborId)) {
-                    visited2.add(neighborId);
-                    queue2.push(neighborId);
-                  }
+            const side2Atoms = new Set<string>();
+            const visited2 = new Set<string>();
+            const queue2 = [side2Start];
+            visited2.add(side2Start);
+            visited2.add(side1Start);
+            while (queue2.length > 0) {
+              const currentId = queue2.shift()!;
+              side2Atoms.add(currentId);
+              const currentBonds = stateRef.current.molecule.bonds.filter(
+                b => b.atom1Id === currentId || b.atom2Id === currentId
+              );
+              for (const b of currentBonds) {
+                const neighborId = b.atom1Id === currentId ? b.atom2Id : b.atom1Id;
+                if (neighborId === null) continue;
+                if (!visited2.has(neighborId)) {
+                  visited2.add(neighborId);
+                  queue2.push(neighborId);
                 }
               }
-              bestRotateAtoms = side2Atoms;
-              bestRotateSize = side2Size;
-              bestFixedAtomId = side1Start;
+            }
+            // 所有选中原子必须在 side2 的连通分量中
+            const allInSide2 = selectedAtoms.every(id => side2Atoms.has(id));
+            if (allInSide2) {
+              const side2Size = stateRef.current.molecule.atoms.length - side1Atoms.size;
+              if (side2Size < bestRotateSize) {
+                bestBond = { atom1Id: bond.atom1Id, atom2Id: bond.atom2Id };
+                bestRotateAtoms = side2Atoms;
+                bestRotateSize = side2Size;
+                bestFixedAtomId = side1Start;
+              }
             }
           }
         }
@@ -2378,32 +2416,35 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
 
       // 选中原子在side2
       if (!side1Atoms.has(startAtomId)) {
-        const side2Size = stateRef.current.molecule.atoms.length - side1Atoms.size;
-        if (side2Size < bestRotateSize) {
-          bestBond = { atom1Id: bond.atom1Id, atom2Id: bond.atom2Id };
-          const side2Atoms = new Set<string>();
-          const visited2 = new Set<string>();
-          const queue2 = [side2Start];
-          visited2.add(side2Start);
-          visited2.add(side1Start);
-          while (queue2.length > 0) {
-            const currentId = queue2.shift()!;
-            side2Atoms.add(currentId);
-            const currentBonds = stateRef.current.molecule.bonds.filter(
-              b => b.atom1Id === currentId || b.atom2Id === currentId
-            );
-            for (const b of currentBonds) {
-              const neighborId = b.atom1Id === currentId ? b.atom2Id : b.atom1Id;
-              if (neighborId === null) continue;
-              if (!visited2.has(neighborId)) {
-                visited2.add(neighborId);
-                queue2.push(neighborId);
-              }
+        const side2Atoms = new Set<string>();
+        const visited2 = new Set<string>();
+        const queue2 = [side2Start];
+        visited2.add(side2Start);
+        visited2.add(side1Start);
+        while (queue2.length > 0) {
+          const currentId = queue2.shift()!;
+          side2Atoms.add(currentId);
+          const currentBonds = stateRef.current.molecule.bonds.filter(
+            b => b.atom1Id === currentId || b.atom2Id === currentId
+          );
+          for (const b of currentBonds) {
+            const neighborId = b.atom1Id === currentId ? b.atom2Id : b.atom1Id;
+            if (neighborId === null) continue;
+            if (!visited2.has(neighborId)) {
+              visited2.add(neighborId);
+              queue2.push(neighborId);
             }
           }
-          bestRotateAtoms = side2Atoms;
-          bestRotateSize = side2Size;
-          bestFixedAtomId = side1Start;
+        }
+        // startAtom 必须在 side2 的连通分量中（排除孤立原子跨组件匹配）
+        if (side2Atoms.has(startAtomId)) {
+          const side2Size = stateRef.current.molecule.atoms.length - side1Atoms.size;
+          if (side2Size < bestRotateSize) {
+            bestBond = { atom1Id: bond.atom1Id, atom2Id: bond.atom2Id };
+            bestRotateAtoms = side2Atoms;
+            bestRotateSize = side2Size;
+            bestFixedAtomId = side1Start;
+          }
         }
       }
     }
@@ -2411,14 +2452,12 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
     if (bestBond && bestRotateAtoms && bestFixedAtomId) {
       const rotateAtom = stateRef.current.molecule.atoms.find(a => a.id === (bestRotateAtoms!.has(bestBond!.atom1Id) ? bestBond!.atom1Id : bestBond!.atom2Id));
       const fixedAtom = stateRef.current.molecule.atoms.find(a => a.id === bestFixedAtomId);
-
       if (rotateAtom && fixedAtom) {
         const rotationAxis = new THREE.Vector3(
           rotateAtom.position.x - fixedAtom.position.x,
           rotateAtom.position.y - fixedAtom.position.y,
           rotateAtom.position.z - fixedAtom.position.z
         ).normalize();
-
         return {
           atoms: Array.from(bestRotateAtoms),
           fixedAtomId: bestFixedAtomId,
@@ -2459,14 +2498,8 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
     const initialPositions = interactionRef.current.initialPositions;
     const noRotation = interactionRef.current.noRotation;
     
-    console.log('[moveConstrainedGroup] rotationFixedAtomId:', rotationFixedAtomId, 'rotationAxis:', rotationAxis, 'rotationCenterId:', rotationCenterId, 'noRotation:', noRotation);
-    console.log('[moveConstrainedGroup] constrainedAtoms:', constrainedAtoms);
-    console.log('[moveConstrainedGroup] initialPositions keys:', Object.keys(initialPositions));
-    console.log('[moveConstrainedGroup] draggedAtomId:', draggedAtomId);
-    
     // 如果明确标记为不允许旋转，直接返回，不执行任何旋转
     if (noRotation) {
-      console.log('[moveConstrainedGroup] noRotation flag set - skipping rotation');
       return;
     }
     
@@ -2579,6 +2612,46 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
           });
         }
       });
+      // 旋转空头键端点
+      constrainedAtoms.forEach(atomId => {
+        const emptyBonds = stateRef.current.molecule.bonds.filter(
+          b => (b.atom1Id === atomId && b.atom2Id === null && b.atom2Position) ||
+               (b.atom2Id === atomId && b.atom1Id === null && b.atom1Position)
+        );
+        for (const eb of emptyBonds) {
+          const emptyPos = eb.atom1Id === atomId ? eb.atom2Position : eb.atom1Position;
+          if (!emptyPos) continue;
+          const eKey = eb.atom1Id === atomId ? 'atom2Position' : 'atom1Position';
+          const vec = new THREE.Vector3(
+            emptyPos.x - centerInitialPos.x,
+            emptyPos.y - centerInitialPos.y,
+            emptyPos.z - centerInitialPos.z
+          );
+          vec.applyQuaternion(quaternion);
+          const newPos = {
+            x: centerInitialPos.x + vec.x,
+            y: centerInitialPos.y + vec.y,
+            z: centerInitialPos.z + vec.z,
+          };
+          eb[eKey] = newPos;
+          if (updateBondPositionRef.current) {
+            updateBondPositionRef.current(eb.id, { [eKey]: newPos });
+          }
+          if (groupRef.current) {
+            const adjustedPos = {
+              x: newPos.x - center3D.x,
+              y: newPos.y - center3D.y,
+              z: newPos.z - center3D.z,
+            };
+            groupRef.current.children.forEach(child => {
+              if (child.userData.type === 'bondEndpoint' && child.userData.id === eb.id &&
+                  child.userData.end === (eKey === 'atom2Position' ? 'atom2' : 'atom1')) {
+                child.position.set(adjustedPos.x, adjustedPos.y, adjustedPos.z);
+              }
+            });
+          }
+        }
+      });
     } else if (selectedAtoms.length > 1 && rotationAxis) {
       // 多选模式：按选中原子组的中心旋转（保持原来的功能）
       // 只有在 rotationAxis 存在时才允许旋转（即不是双键等刚性结构）
@@ -2663,8 +2736,6 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
             const atomRadius = 0.3;
             const snapThreshold = 0.1;
             
-            console.log('吸附检查 - 原子:', atomId, '距离:', distance, '阈值:', atomRadius + snapThreshold);
-            
             if (distance < atomRadius + snapThreshold) {
               // 计算原子在直线上的投影点（虽然这里不直接使用，但保留计算逻辑为了注释）
               // const projectLength = toCenter.dot(lineInfo.dir);
@@ -2735,6 +2806,46 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
             });
           }
         });
+        // 旋转空头键端点
+        selectedAtoms.forEach(atomId => {
+          const emptyBonds = stateRef.current.molecule.bonds.filter(
+            b => (b.atom1Id === atomId && b.atom2Id === null && b.atom2Position) ||
+                 (b.atom2Id === atomId && b.atom1Id === null && b.atom1Position)
+          );
+          for (const eb of emptyBonds) {
+            const emptyPos = eb.atom1Id === atomId ? eb.atom2Position : eb.atom1Position;
+            if (!emptyPos) continue;
+            const eKey = eb.atom1Id === atomId ? 'atom2Position' : 'atom1Position';
+            const vec = new THREE.Vector3(
+              emptyPos.x - center.x,
+              emptyPos.y - center.y,
+              emptyPos.z - center.z
+            );
+            vec.applyQuaternion(quaternion);
+            const newPos = {
+              x: center.x + vec.x,
+              y: center.y + vec.y,
+              z: center.z + vec.z,
+            };
+            eb[eKey] = newPos;
+            if (updateBondPositionRef.current) {
+              updateBondPositionRef.current(eb.id, { [eKey]: newPos });
+            }
+            if (groupRef.current) {
+              const adjustedPos = {
+                x: newPos.x - center3D.x,
+                y: newPos.y - center3D.y,
+                z: newPos.z - center3D.z,
+              };
+              groupRef.current.children.forEach(child => {
+                if (child.userData.type === 'bondEndpoint' && child.userData.id === eb.id &&
+                    child.userData.end === (eKey === 'atom2Position' ? 'atom2' : 'atom1')) {
+                  child.position.set(adjustedPos.x, adjustedPos.y, adjustedPos.z);
+                }
+              });
+            }
+          }
+        });
       }
     }
     
@@ -2743,151 +2854,157 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
   };
 
   const moveAtomWithConstraints = (atomId: string, targetPos: { x: number; y: number; z: number }) => {
-    const neighbors = stateRef.current.molecule.bonds
-      .filter(b => b.atom1Id === atomId || b.atom2Id === atomId)
-      .map(b => {
-        const neighborId = b.atom1Id === atomId ? b.atom2Id : b.atom1Id;
-        const neighbor = stateRef.current.molecule.atoms.find(a => a.id === neighborId);
-        return neighbor ? { atom: neighbor, targetLength: BOND_LENGTH } : null;
-      })
-      .filter(n => n !== null) as { atom: Atom; targetLength: number }[];
-
-    let finalTargetPos = targetPos;
-    
-    let newPos = { ...finalTargetPos };
-
-    if (neighbors.length === 1) {
-      const neighbor = neighbors[0].atom;
-      const dx = newPos.x - neighbor.position.x;
-      const dy = newPos.y - neighbor.position.y;
-      const dz = newPos.z - neighbor.position.z;
-      const currentDist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
-      if (currentDist > 0.001) {
-        const scale = neighbors[0].targetLength / currentDist;
-        newPos = {
-          x: neighbor.position.x + dx * scale,
-          y: neighbor.position.y + dy * scale,
-          z: neighbor.position.z + dz * scale,
-        };
-      }
-    } else if (neighbors.length >= 2) {
-      const learningRate = 0.1;
-      const maxIterations = 100;
-      const tolerance = 0.001;
-
-      for (let iter = 0; iter < maxIterations; iter++) {
-        let totalError = 0;
-        let gradient = { x: 0, y: 0, z: 0 };
-
-        for (const { atom: neighbor, targetLength } of neighbors) {
-          const dx = newPos.x - neighbor.position.x;
-          const dy = newPos.y - neighbor.position.y;
-          const dz = newPos.z - neighbor.position.z;
-          const currentDist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-
-          if (currentDist > 0.001) {
-            const error = currentDist - targetLength;
-            totalError += Math.abs(error);
-
-            gradient.x += (dx / currentDist) * error;
-            gradient.y += (dy / currentDist) * error;
-            gradient.z += (dz / currentDist) * error;
-          }
-        }
-
-        if (totalError < tolerance) {
-          break;
-        }
-
-        newPos.x -= learningRate * gradient.x;
-        newPos.y -= learningRate * gradient.y;
-        newPos.z -= learningRate * gradient.z;
-      }
-    }
-
     const allAtoms = stateRef.current.molecule.atoms;
     const draggedAtom = allAtoms.find(a => a.id === atomId);
-    if (draggedAtom) {
-      const draggedRadius = ELEMENT_RADII[draggedAtom.symbol] || CARBON_RADIUS;
-      
-      // 收集不应被排斥的原子ID：
-      // 1. 正在吸附的键的空头所连接的原子
-      // 2. 有空头键的原子（拖拽原子可能要连接到其空头）
-      const noRepelAtomIds = new Set<string>();
-      if (interactionRef.current.snapTargetBondId && interactionRef.current.snapTargetEndpoint) {
-        const snapBond = stateRef.current.molecule.bonds.find(b => b.id === interactionRef.current.snapTargetBondId);
-        if (snapBond) {
-          const connectedId = interactionRef.current.snapTargetEndpoint === 'atom1' ? snapBond.atom2Id : snapBond.atom1Id;
-          if (connectedId) noRepelAtomIds.add(connectedId);
-        }
-      }
-      // 检查每个其他原子是否有空头键，如果有则不排斥（允许拖拽原子靠近以吸附）
-      for (const bond of stateRef.current.molecule.bonds) {
-        if (bond.atom1Id === null || bond.atom2Id === null) {
-          // 这个键有空头，其连接的原子不应被排斥
-          const connectedId = bond.atom1Id !== null ? bond.atom1Id : bond.atom2Id;
-          if (connectedId && connectedId !== atomId) {
-            noRepelAtomIds.add(connectedId);
-          }
-        }
-      }
-      
-      for (const otherAtom of allAtoms) {
-        if (otherAtom.id === atomId) continue;
-        // 如果正在吸附到键的空头，或有空头键可吸附，不排斥该原子
-        if (noRepelAtomIds.has(otherAtom.id)) continue;
-        
-        const otherRadius = ELEMENT_RADII[otherAtom.symbol] || CARBON_RADIUS;
-        const minDist = draggedRadius + otherRadius;
-        
-        const dx = newPos.x - otherAtom.position.x;
-        const dy = newPos.y - otherAtom.position.y;
-        const dz = newPos.z - otherAtom.position.z;
-        const currentDist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        
-        if (currentDist < minDist && currentDist > 0.001) {
-          const pushDir = {
-            x: dx / currentDist,
-            y: dy / currentDist,
-            z: dz / currentDist
-          };
-          
-          newPos = {
-            x: otherAtom.position.x + pushDir.x * minDist,
-            y: otherAtom.position.y + pushDir.y * minDist,
-            z: otherAtom.position.z + pushDir.z * minDist
-          };
+    if (!draggedAtom) return;
+
+    const delta = {
+      x: targetPos.x - draggedAtom.position.x,
+      y: targetPos.y - draggedAtom.position.y,
+      z: targetPos.z - draggedAtom.position.z,
+    };
+
+    if (Math.abs(delta.x) < 0.001 && Math.abs(delta.y) < 0.001 && Math.abs(delta.z) < 0.001) {
+      return;
+    }
+
+    // BFS收集整个连通分量
+    const movedAtomIds = new Set<string>();
+    const visited = new Set<string>();
+    const queue = [atomId];
+    visited.add(atomId);
+    while (queue.length > 0) {
+      const curId = queue.shift()!;
+      movedAtomIds.add(curId);
+      const curBonds = stateRef.current.molecule.bonds.filter(b => b.atom1Id === curId || b.atom2Id === curId);
+      for (const b of curBonds) {
+        const neighborId = b.atom1Id === curId ? b.atom2Id : b.atom1Id;
+        if (neighborId !== null && !visited.has(neighborId)) {
+          visited.add(neighborId);
+          queue.push(neighborId);
         }
       }
     }
 
-    if (showReferencePlane && referencePlaneRef.current && groupRef.current) {
-      const planeWorldPos = new THREE.Vector3();
-      referencePlaneRef.current.getWorldPosition(planeWorldPos);
-      
-      const planeNormal = new THREE.Vector3(0, 0, 1);
-      planeNormal.applyQuaternion(referencePlaneRef.current.getWorldQuaternion(new THREE.Quaternion()));
-      
-      const worldPos = new THREE.Vector3(newPos.x, newPos.y, newPos.z);
-      worldPos.applyMatrix4(groupRef.current.matrixWorld);
-      
-      const distance = Math.abs(worldPos.distanceTo(planeWorldPos));
-      
-      if (distance < 0.5) {
-        const projectedPoint = worldPos.clone().sub(planeNormal.clone().multiplyScalar(planeNormal.dot(worldPos.clone().sub(planeWorldPos))));
-        const localProjected = groupRef.current.worldToLocal(projectedPoint);
-        
-        newPos = {
-          x: localProjected.x,
-          y: localProjected.y,
-          z: localProjected.z
+    // 计算所有移动原子的新位置
+    const newPositions: Record<string, { x: number; y: number; z: number }> = {};
+    for (const id of movedAtomIds) {
+      const a = allAtoms.find(atom => atom.id === id);
+      if (a) {
+        newPositions[id] = {
+          x: a.position.x + delta.x,
+          y: a.position.y + delta.y,
+          z: a.position.z + delta.z,
         };
       }
     }
 
-    updateAtomPositionRef.current(atomId, newPos);
-    return newPos;
+    // 碰撞检测：检查移动原子与未移动原子之间的空间冲突
+    // 排除直接键连的原子对（它们距离天然很近）
+    const bondedPairs = new Set<string>();
+    for (const b of stateRef.current.molecule.bonds) {
+      if (b.atom1Id && b.atom2Id) {
+        bondedPairs.add(`${b.atom1Id}-${b.atom2Id}`);
+        bondedPairs.add(`${b.atom2Id}-${b.atom1Id}`);
+      }
+    }
+
+    let hasCollision = false;
+    for (const idA of movedAtomIds) {
+      const posA = newPositions[idA];
+      if (!posA) continue;
+      const atomA = allAtoms.find(a => a.id === idA);
+      if (!atomA) continue;
+      const radiusA = ELEMENT_RADII[atomA.symbol] || CARBON_RADIUS;
+
+      for (const otherAtom of allAtoms) {
+        if (movedAtomIds.has(otherAtom.id)) continue;
+        if (bondedPairs.has(`${idA}-${otherAtom.id}`)) continue;
+
+        const radiusB = ELEMENT_RADII[otherAtom.symbol] || CARBON_RADIUS;
+        const minDist = radiusA + radiusB + 0.2;
+
+        const dx = posA.x - otherAtom.position.x;
+        const dy = posA.y - otherAtom.position.y;
+        const dz = posA.z - otherAtom.position.z;
+        const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+
+        if (dist < minDist && dist > 0.001) {
+          hasCollision = true;
+          break;
+        }
+      }
+      if (hasCollision) break;
+    }
+
+    if (hasCollision) {
+      return;
+    }
+
+    // 应用所有位置更新
+    for (const [id, pos] of Object.entries(newPositions)) {
+      updateAtomPositionRef.current(id, pos);
+      const a = allAtoms.find(atom => atom.id === id);
+      if (a) a.position = pos;
+    }
+
+    // 移动空头键端点
+    for (const [id, pos] of Object.entries(newPositions)) {
+      const atomEmptyBonds = stateRef.current.molecule.bonds.filter(
+        b => (b.atom1Id === id && b.atom2Id === null && b.atom2Position) ||
+             (b.atom2Id === id && b.atom1Id === null && b.atom1Position)
+      );
+      for (const eb of atomEmptyBonds) {
+        let eKey: 'atom1Position' | 'atom2Position' | null = null;
+        let origPos: { x: number; y: number; z: number } | null = null;
+        if (eb.atom1Id === id && eb.atom2Id === null && eb.atom2Position) {
+          eKey = 'atom2Position'; origPos = eb.atom2Position;
+        } else if (eb.atom2Id === id && eb.atom1Id === null && eb.atom1Position) {
+          eKey = 'atom1Position'; origPos = eb.atom1Position;
+        }
+        if (eKey && origPos) {
+          const newPos = {
+            x: origPos.x + delta.x,
+            y: origPos.y + delta.y,
+            z: origPos.z + delta.z,
+          };
+          eb[eKey] = newPos;
+          if (updateBondPositionRef.current) {
+            updateBondPositionRef.current(eb.id, { [eKey]: newPos });
+          }
+        }
+      }
+    }
+
+    // 立即更新 Three.js 网格位置，不依赖 React 渲染
+    if (groupRef.current) {
+      for (const [id, pos] of Object.entries(newPositions)) {
+        for (const child of groupRef.current.children) {
+          if (child.userData?.type === 'atom' && child.userData?.id === id) {
+            child.position.set(pos.x, pos.y, pos.z);
+            break;
+          }
+        }
+      }
+      // 更新空头键端点 Three.js 网格
+      for (const [id, pos] of Object.entries(newPositions)) {
+        const atomEmptyBonds = stateRef.current.molecule.bonds.filter(
+          b => (b.atom1Id === id && b.atom2Id === null) ||
+               (b.atom2Id === id && b.atom1Id === null)
+        );
+        for (const eb of atomEmptyBonds) {
+          const emptyPos = eb.atom1Id === id ? eb.atom2Position : eb.atom1Position;
+          if (!emptyPos) continue;
+          for (const child of groupRef.current.children) {
+            if (child.userData?.type === 'bondEndpoint' && child.userData?.id === eb.id) {
+              child.position.set(emptyPos.x, emptyPos.y, emptyPos.z);
+            }
+          }
+        }
+      }
+    }
+
+    return newPositions[atomId];
   };
 
   const moveBondEndpointOnSphere = (
@@ -2929,6 +3046,8 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
     }
 
     const newPos = moveAtomWithConstraints(movingAtomId!, finalTargetPos);
+
+    if (!newPos) return;
 
     const neighbors = stateRef.current.molecule.bonds
       .filter(b => b.atom1Id === movingAtomId || b.atom2Id === movingAtomId)
@@ -3630,7 +3749,6 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
           if (atom) {
             // 确保 matrixWorld 是最新的
             groupRef.current!.updateMatrixWorld();
-            // 使用 localToWorld 获取正确的世界坐标
             const worldPos = new THREE.Vector3(
               atom.position.x,
               atom.position.y,
@@ -3645,111 +3763,104 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
             );
           }
           
-          // 检查是否是单个原子拖拽（没有键，或者该原子没有连接其他原子）
-          const atomBonds = stateRef.current.molecule.bonds.filter(
-            b => b.atom1Id === clickedAtomId || b.atom2Id === clickedAtomId
-          );
-          // 如果这个原子是独立的（没有键）或者只有这个原子和一个H，我们认为是单个原子拖拽
-          if (atomBonds.length === 0) {
-            interactionRef.current.isSingleAtomDrag = true;
-            interactionRef.current.singleAtomOriginalPosition = { ...atom!.position };
-          } else {
-            interactionRef.current.isSingleAtomDrag = false;
-          }
-
-          // 识别约束基团时，需要找到正确的 centerAtomId
-          // 如果选中的有非H原子，用那个；否则找H的共同邻居C
-          let centerAtomIdForRotation = clickedAtomId;
-          
-          // 检查选中的原子中是否有非H原子
-          const hasNonH = newSelectedAtoms.some(id => {
-            const a = stateRef.current.molecule.atoms.find(atom => atom.id === id);
-            return a && a.symbol !== 'H';
-          });
-          
-          if (hasNonH) {
-            // 有非H原子，用那个
-            const nonHAtom = newSelectedAtoms.find(id => {
-              const a = stateRef.current.molecule.atoms.find(atom => atom.id === id);
-              return a && a.symbol !== 'H';
-            });
-            if (nonHAtom) {
-              centerAtomIdForRotation = nonHAtom;
-            }
-          } else {
-            // 都是H，找共同邻居或连接路径
-            const neighborMap = new Map<string, number>();
-            const hCenters: string[] = []; // 每个H连接的非H邻居
-            newSelectedAtoms.forEach(atomId => {
-              const bonds = stateRef.current.molecule.bonds.filter(
-                b => b.atom1Id === atomId || b.atom2Id === atomId
-              );
-              bonds.forEach(bond => {
-                const neighborId = bond.atom1Id === atomId ? bond.atom2Id : bond.atom1Id;
-                if (neighborId === null) return;
-                const neighbor = stateRef.current.molecule.atoms.find(a => a.id === neighborId);
-                if (neighbor && neighbor.symbol !== 'H') {
-                  neighborMap.set(neighborId, (neighborMap.get(neighborId) || 0) + 1);
-                  hCenters.push(neighborId);
-                }
-              });
-            });
-            
-            // 优先找所有H的共同邻居
-            for (const [neighborId, count] of neighborMap) {
-              if (count === newSelectedAtoms.length) {
-                centerAtomIdForRotation = neighborId;
-                break;
-              }
-            }
-            
-            // 如果没有共同邻居，找H所在中心之间的连接键
-            // 用被点击的H的中心作为旋转侧，另一个中心作为固定端
-            if (centerAtomIdForRotation === clickedAtomId) {
-              const clickedHBond = stateRef.current.molecule.bonds.find(
-                b => b.atom1Id === clickedAtomId || b.atom2Id === clickedAtomId
-              );
-              if (clickedHBond) {
-                const clickedCenter = clickedHBond.atom1Id === clickedAtomId ? clickedHBond.atom2Id : clickedHBond.atom1Id;
-                if (clickedCenter !== null) {
-                  const clickedCenterAtom = stateRef.current.molecule.atoms.find(a => a.id === clickedCenter);
-                  if (clickedCenterAtom && clickedCenterAtom.symbol !== 'H') {
-                    centerAtomIdForRotation = clickedCenter;
+          // 识别约束基团，判断是否可以绕键旋转
+          {
+            // 点击H原子时，使用其连接的重原子作为旋转分析起点
+            let rotationStartAtomId = clickedAtomId;
+            if (newSelectedAtoms.length === 1) {
+              const clickedAtom = stateRef.current.molecule.atoms.find(a => a.id === clickedAtomId);
+              if (clickedAtom && clickedAtom.symbol === 'H') {
+                const hBond = stateRef.current.molecule.bonds.find(
+                  b => (b.atom1Id === clickedAtomId && b.atom2Id !== null) ||
+                       (b.atom2Id === clickedAtomId && b.atom1Id !== null)
+                );
+                if (hBond) {
+                  const heavyId = hBond.atom1Id === clickedAtomId ? hBond.atom2Id! : hBond.atom1Id!;
+                  const heavyAtom = stateRef.current.molecule.atoms.find(a => a.id === heavyId);
+                  if (heavyAtom && heavyAtom.symbol !== 'H') {
+                    rotationStartAtomId = heavyId;
                   }
                 }
               }
             }
-          }
+            const groupInfo = identifyConstrainedGroup(rotationStartAtomId, newSelectedAtoms);
+            interactionRef.current.constrainedAtoms = groupInfo.atoms;
+            interactionRef.current.rotationFixedAtomId = groupInfo.fixedAtomId;
+            interactionRef.current.rotationAxis = groupInfo.rotationAxis;
+            interactionRef.current.rotationCenterId = groupInfo.rotationCenterId;
+            interactionRef.current.noRotation = groupInfo.noRotation || false;
 
-          console.log('[onMouseDown] centerAtomIdForRotation:', centerAtomIdForRotation);
+            const canRotate = !groupInfo.noRotation && groupInfo.rotationAxis && groupInfo.fixedAtomId;
 
-          // 识别约束基团
-          const groupInfo = identifyConstrainedGroup(centerAtomIdForRotation, newSelectedAtoms);
-          console.log('[onMouseDown] groupInfo:', groupInfo);
-          interactionRef.current.constrainedAtoms = groupInfo.atoms;
-          interactionRef.current.rotationFixedAtomId = groupInfo.fixedAtomId;
-          interactionRef.current.rotationAxis = groupInfo.rotationAxis;
-          interactionRef.current.rotationCenterId = groupInfo.rotationCenterId;
-          interactionRef.current.noRotation = groupInfo.noRotation || false;
-          
-          // 保存初始位置
-          const initialPositions: Record<string, { x: number; y: number; z: number }> = {};
-          for (const atomId of groupInfo.atoms) {
-            const a = stateRef.current.molecule.atoms.find(a => a.id === atomId);
-            if (a) {
-              initialPositions[atomId] = { ...a.position };
+            // 保存初始位置
+            const initialPositions: Record<string, { x: number; y: number; z: number }> = {};
+            for (const atomId of groupInfo.atoms) {
+              const a = stateRef.current.molecule.atoms.find(a => a.id === atomId);
+              if (a) {
+                initialPositions[atomId] = { ...a.position };
+              }
+            }
+            if (groupInfo.rotationCenterId && !initialPositions[groupInfo.rotationCenterId]) {
+              const centerAtom = stateRef.current.molecule.atoms.find(a => a.id === groupInfo.rotationCenterId);
+              if (centerAtom) {
+                initialPositions[groupInfo.rotationCenterId] = { ...centerAtom.position };
+              }
+            }
+            interactionRef.current.initialPositions = initialPositions;
+            interactionRef.current.currentAtomPositions = { ...initialPositions };
+
+            if (canRotate) {
+              // 可旋转：走旋转模式
+              interactionRef.current.isSingleAtomDrag = false;
+            } else {
+              // 不可旋转：走拖拽移动模式
+              interactionRef.current.isSingleAtomDrag = true;
+              interactionRef.current.singleAtomOriginalPosition = { ...atom!.position };
+
+              const bfsGroupIds: string[] = [];
+              const bfsVisited = new Set<string>();
+              const bfsQueue = [clickedAtomId];
+              bfsVisited.add(clickedAtomId);
+              while (bfsQueue.length > 0) {
+                const curId = bfsQueue.shift()!;
+                bfsGroupIds.push(curId);
+                const curBonds = stateRef.current.molecule.bonds.filter(
+                  b => b.atom1Id === curId || b.atom2Id === curId
+                );
+                for (const b of curBonds) {
+                  const nId = b.atom1Id === curId ? b.atom2Id : b.atom1Id;
+                  if (nId !== null && !bfsVisited.has(nId)) {
+                    bfsVisited.add(nId);
+                    bfsQueue.push(nId);
+                  }
+                }
+              }
+              interactionRef.current.singleGroupAtomIds = bfsGroupIds;
+              const groupOrigPositions: Record<string, { x: number; y: number; z: number }> = {};
+              for (const gid of bfsGroupIds) {
+                const ga = stateRef.current.molecule.atoms.find(a => a.id === gid);
+                if (ga) groupOrigPositions[gid] = { ...ga.position };
+              }
+              interactionRef.current.singleGroupOriginalPositions = groupOrigPositions;
+              // 收集空头键端点位置
+              const groupEmptyBondPositions: Record<string, { bondId: string, endpoint: 'atom1' | 'atom2', originalPosition: { x: number; y: number; z: number } }> = {};
+              for (const gid of bfsGroupIds) {
+                const emptyBonds = stateRef.current.molecule.bonds.filter(
+                  b => (b.atom1Id === gid && b.atom2Id === null) ||
+                       (b.atom2Id === gid && b.atom1Id === null)
+                );
+                for (const eb of emptyBonds) {
+                  if (eb.atom1Id === gid && eb.atom2Id === null && eb.atom2Position) {
+                    groupEmptyBondPositions[eb.id + '_atom2'] = { bondId: eb.id, endpoint: 'atom2', originalPosition: { ...eb.atom2Position } };
+                  } else if (eb.atom2Id === gid && eb.atom1Id === null && eb.atom1Position) {
+                    groupEmptyBondPositions[eb.id + '_atom1'] = { bondId: eb.id, endpoint: 'atom1', originalPosition: { ...eb.atom1Position } };
+                  }
+                }
+              }
+              interactionRef.current.rigidGroupEmptyBondPositions = groupEmptyBondPositions;
             }
           }
-          // 同时保存旋转中心的初始位置（如果存在且不在约束基团中）
-          if (groupInfo.rotationCenterId && !initialPositions[groupInfo.rotationCenterId]) {
-            const centerAtom = stateRef.current.molecule.atoms.find(a => a.id === groupInfo.rotationCenterId);
-            if (centerAtom) {
-              initialPositions[groupInfo.rotationCenterId] = { ...centerAtom.position };
-            }
-          }
-          interactionRef.current.initialPositions = initialPositions;
-          interactionRef.current.currentAtomPositions = { ...initialPositions };
-          
+
           // 保存鼠标开始位置
           interactionRef.current.dragStartMousePosition = { x: e.clientX, y: e.clientY };
           interactionRef.current.lastMousePosition = { x: e.clientX, y: e.clientY };
@@ -3995,9 +4106,51 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
                 };
               }
               
+              // 碰撞检测：检查刚性基团移动后是否与其他原子冲突
+              const rigidOrigPositions = interactionRef.current.rigidGroupOriginalPositions;
+              const rigidAtomIds = Object.keys(rigidOrigPositions);
+              const rigidSet = new Set(rigidAtomIds);
+              const bondedPairs = new Set<string>();
+              for (const b of stateRef.current.molecule.bonds) {
+                if (b.atom1Id && b.atom2Id) {
+                  bondedPairs.add(`${b.atom1Id}-${b.atom2Id}`);
+                  bondedPairs.add(`${b.atom2Id}-${b.atom1Id}`);
+                }
+              }
+              let hasCollision = false;
+              for (const idA of rigidAtomIds) {
+                const atomA = stateRef.current.molecule.atoms.find(a => a.id === idA);
+                if (!atomA) continue;
+                const origA = rigidOrigPositions[idA];
+                if (!origA) continue;
+                const testPosA = {
+                  x: origA.x + totalDelta.x,
+                  y: origA.y + totalDelta.y,
+                  z: origA.z + totalDelta.z,
+                };
+                const radiusA = ELEMENT_RADII[atomA.symbol] || CARBON_RADIUS;
+                for (const otherAtom of stateRef.current.molecule.atoms) {
+                  if (rigidSet.has(otherAtom.id)) continue;
+                  if (bondedPairs.has(`${idA}-${otherAtom.id}`)) continue;
+                  const radiusB = ELEMENT_RADII[otherAtom.symbol] || CARBON_RADIUS;
+                  const minDist = radiusA + radiusB + 0.2;
+                  const dx = testPosA.x - otherAtom.position.x;
+                  const dy = testPosA.y - otherAtom.position.y;
+                  const dz = testPosA.z - otherAtom.position.z;
+                  const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                  if (dist < minDist && dist > 0.001) {
+                    hasCollision = true;
+                    break;
+                  }
+                }
+                if (hasCollision) break;
+              }
+              if (hasCollision) {
+                return; // 碰撞阻止移动
+              }
+              
               // 使用原始位置+总位移移动所有刚性基团原子（避免stale state问题）
-              const origPositions = interactionRef.current.rigidGroupOriginalPositions;
-              for (const [atomId, origPos] of Object.entries(origPositions)) {
+              for (const [atomId, origPos] of Object.entries(rigidOrigPositions)) {
                 updateAtomPositionRef.current(atomId, {
                   x: origPos.x + totalDelta.x,
                   y: origPos.y + totalDelta.y,
@@ -4037,6 +4190,24 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
                   updateBondPositionRef.current!(entry.bondId, { atom1Position: newPos });
                 } else {
                   updateBondPositionRef.current!(entry.bondId, { atom2Position: newPos });
+                }
+              }
+              
+              // 立即更新 Three.js 网格位置
+              if (groupRef.current) {
+                const children = groupRef.current.children;
+                for (const [atomId, origPos] of Object.entries(rigidOrigPositions)) {
+                  const newPos = {
+                    x: origPos.x + totalDelta.x,
+                    y: origPos.y + totalDelta.y,
+                    z: origPos.z + totalDelta.z,
+                  };
+                  for (const child of children) {
+                    if (child.userData?.type === 'atom' && child.userData?.id === atomId) {
+                      child.position.set(newPos.x, newPos.y, newPos.z);
+                      break;
+                    }
+                  }
                 }
               }
               
@@ -4107,6 +4278,111 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
               break;
             }
           }
+
+          // === 空头键小球跨维驳接：屏幕投影重叠检测 ===
+          // 检查当前拖拽的键端是否是空头端
+          const currentBond = stateRef.current.molecule.bonds.find(b => b.id === bondId);
+          const isEndpointEmpty = endKey === 'atom1' ? (currentBond?.atom1Id === null) : (currentBond?.atom2Id === null);
+          // 获取空头键连接的原子ID（非空端）
+          const connectedAtomId = endKey === 'atom1' ? currentBond?.atom2Id : currentBond?.atom1Id;
+
+          if (isEndpointEmpty && cameraRef.current) {
+            // 将小球的局部坐标转为世界坐标，再投影到屏幕坐标
+            const endpointWorldPos = new THREE.Vector3(localIntersection.x, localIntersection.y, localIntersection.z);
+            groupRef.current.localToWorld(endpointWorldPos);
+            const endpointScreen = endpointWorldPos.clone().project(cameraRef.current);
+            const endpointScreenX = (endpointScreen.x * 0.5 + 0.5) * rect2.width;
+            const endpointScreenY = (-endpointScreen.y * 0.5 + 0.5) * rect2.height;
+
+            // 小球在屏幕上的显示半径（像素）
+            const endpointBallRadius3D = BOND_RADIUS * 1.5; // 与渲染一致
+            const endpointWorldPos2 = endpointWorldPos.clone();
+            endpointWorldPos2.x += endpointBallRadius3D;
+            const endpointScreen2 = endpointWorldPos2.clone().project(cameraRef.current);
+            const endpointScreenX2 = (endpointScreen2.x * 0.5 + 0.5) * rect2.width;
+            const endpointScreenY2 = (-endpointScreen2.y * 0.5 + 0.5) * rect2.height;
+            const endpointScreenRadius = Math.sqrt(
+              (endpointScreenX2 - endpointScreenX) ** 2 +
+              (endpointScreenY2 - endpointScreenY) ** 2
+            );
+
+            // 遍历所有有空键位的原子，检查屏幕投影重叠
+            let bestAtomId: string | null = null;
+            let bestOverlap = -Infinity;
+
+            for (const atom of stateRef.current.molecule.atoms) {
+              // 排除空头键自身连接的原子
+              if (connectedAtomId && atom.id === connectedAtomId) continue;
+              // 必须有空键位
+              if (!hasFreeValence(stateRef.current.molecule, atom.id)) continue;
+
+              // 将原子位置转为世界坐标再投影到屏幕
+              const atomWorldPos = new THREE.Vector3(atom.position.x, atom.position.y, atom.position.z);
+              groupRef.current.localToWorld(atomWorldPos);
+              const atomScreen = atomWorldPos.clone().project(cameraRef.current);
+              const atomScreenX = (atomScreen.x * 0.5 + 0.5) * rect2.width;
+              const atomScreenY = (-atomScreen.y * 0.5 + 0.5) * rect2.height;
+
+              // 原子在屏幕上的显示半径（像素）
+              const atomRadius3D = atom.radius || getCovalentRadius(atom.symbol);
+              const atomWorldPos2 = atomWorldPos.clone();
+              atomWorldPos2.x += atomRadius3D;
+              const atomScreen2 = atomWorldPos2.clone().project(cameraRef.current);
+              const atomScreenX2 = (atomScreen2.x * 0.5 + 0.5) * rect2.width;
+              const atomScreenY2 = (-atomScreen2.y * 0.5 + 0.5) * rect2.height;
+              const atomScreenRadius = Math.sqrt(
+                (atomScreenX2 - atomScreenX) ** 2 +
+                (atomScreenY2 - atomScreenY) ** 2
+              );
+
+              // 计算屏幕上两圆心的距离
+              const screenDist = Math.sqrt(
+                (endpointScreenX - atomScreenX) ** 2 +
+                (endpointScreenY - atomScreenY) ** 2
+              );
+
+              // 重叠条件：两圆心距离 < 两半径之和（视觉上重叠）
+              const overlapThreshold = endpointScreenRadius + atomScreenRadius;
+              if (screenDist < overlapThreshold) {
+                const overlap = overlapThreshold - screenDist;
+                if (overlap > bestOverlap) {
+                  bestOverlap = overlap;
+                  bestAtomId = atom.id;
+                }
+              }
+            }
+
+            // 视觉反馈：高亮/取消高亮目标原子
+            const prevSnapId = interactionRef.current.endpointSnapTargetAtomId;
+            if (bestAtomId !== prevSnapId) {
+              // 恢复之前高亮的原子颜色
+              if (prevSnapId && groupRef.current) {
+                for (const child of groupRef.current.children) {
+                  if (child.userData.type === 'atom' && child.userData.id === prevSnapId) {
+                    const mat = (child as THREE.Mesh).material as THREE.MeshPhongMaterial;
+                    if (mat) {
+                      mat.color.setHex(interactionRef.current.endpointSnapTargetOriginalColor);
+                    }
+                    break;
+                  }
+                }
+              }
+              // 高亮新的目标原子
+              if (bestAtomId && groupRef.current) {
+                for (const child of groupRef.current.children) {
+                  if (child.userData.type === 'atom' && child.userData.id === bestAtomId) {
+                    const mat = (child as THREE.Mesh).material as THREE.MeshPhongMaterial;
+                    if (mat) {
+                      interactionRef.current.endpointSnapTargetOriginalColor = mat.color.getHex();
+                      mat.color.set(0x00ff00); // 绿色高亮
+                    }
+                    break;
+                  }
+                }
+              }
+              interactionRef.current.endpointSnapTargetAtomId = bestAtomId;
+            }
+          }
         }
       } else if (interactionRef.current.dragMode === 'moveRef' && interactionRef.current.draggedRef) {
         // 移动参考线或平面，沿着法线方向
@@ -4151,7 +4427,7 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
     const onMouseUp = (e: MouseEvent) => {
       if (activeDirectionRef.current) return;
 
-      // 键端小球释放：恢复原始位置和颜色
+      // 键端小球释放
       if (interactionRef.current.bondEndpointIsDragging &&
           interactionRef.current.selectedBondEndpoint &&
           groupRef.current) {
@@ -4159,6 +4435,8 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
         const endKey = interactionRef.current.selectedBondEndpoint.end;
         const origPos = interactionRef.current.bondEndpointOriginalPosition;
         const origColor = interactionRef.current.bondEndpointOriginalColor;
+
+        // 恢复小球位置和颜色
         for (const child of groupRef.current.children) {
           if (child.userData.type === 'bondEndpoint' &&
               child.userData.id === bondId &&
@@ -4171,6 +4449,342 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
             break;
           }
         }
+
+        // 恢复高亮原子的颜色
+        if (interactionRef.current.endpointSnapTargetAtomId && groupRef.current) {
+          for (const child of groupRef.current.children) {
+            if (child.userData.type === 'atom' && child.userData.id === interactionRef.current.endpointSnapTargetAtomId) {
+              const mat = (child as THREE.Mesh).material as THREE.MeshPhongMaterial;
+              if (mat) {
+                mat.color.setHex(interactionRef.current.endpointSnapTargetOriginalColor);
+              }
+              break;
+            }
+          }
+        }
+
+        // === 空头键小球跨维驳接：触发拼接 ===
+        const snapTargetAtomId = interactionRef.current.endpointSnapTargetAtomId;
+        const currentBond = stateRef.current.molecule.bonds.find(b => b.id === bondId);
+        const isEndpointEmpty = currentBond ? (endKey === 'atom1' ? currentBond.atom1Id === null : currentBond.atom2Id === null) : false;
+
+        if (snapTargetAtomId && isEndpointEmpty && currentBond) {
+          // 保存原始空头端位置（在 bindAtomToBondEndpointRef 修改键之前）
+          const originalEmptyPos = endKey === 'atom1' ? 
+            (currentBond.atom1Position ? { ...currentBond.atom1Position } : null) :
+            (currentBond.atom2Position ? { ...currentBond.atom2Position } : null);
+
+          // 将目标原子绑定到空头键端点
+          bindAtomToBondEndpointRef.current(bondId, snapTargetAtomId, endKey);
+
+          // 公母团拼接：与原子拖拽/键拖拽的拼接规则一致
+          const connectedAtomId = endKey === 'atom1' ? currentBond.atom2Id : currentBond.atom1Id;
+          if (connectedAtomId) {
+            setTimeout(() => {
+              // 用BFS收集连通的原子数来衡量官能团规模
+              const collectGroupSize = (startId: string, excludeId: string): number => {
+                const visited = new Set<string>([excludeId, startId]);
+                const queue = [startId];
+                let count = 0;
+                while (queue.length > 0) {
+                  const curId = queue.shift()!;
+                  count++;
+                  for (const b of stateRef.current.molecule.bonds) {
+                    const otherEnd = b.atom1Id === curId ? b.atom2Id : (b.atom2Id === curId ? b.atom1Id : null);
+                    if (otherEnd !== null && !visited.has(otherEnd)) {
+                      visited.add(otherEnd);
+                      queue.push(otherEnd);
+                    }
+                  }
+                }
+                return count;
+              };
+              const connectedSize = collectGroupSize(connectedAtomId, snapTargetAtomId);
+              const snapSize = collectGroupSize(snapTargetAtomId, connectedAtomId);
+
+              // 确定公团A（移动）和母团B（不动）
+              let publicAtomId: string;
+              let anchorAtomId: string;
+              let idealDir: { x: number; y: number; z: number } | null;
+              if (connectedSize >= snapSize) {
+                // A 是母团（不动），驳接键在 A 上 → 保持母团原有键方向
+                publicAtomId = snapTargetAtomId;
+                anchorAtomId = connectedAtomId;
+                // 使用原始空头端方向：从锚点原子指向空头端
+                const anchorAtom = stateRef.current.molecule.atoms.find(a => a.id === anchorAtomId);
+                if (originalEmptyPos && anchorAtom) {
+                  const dx = originalEmptyPos.x - anchorAtom.position.x;
+                  const dy = originalEmptyPos.y - anchorAtom.position.y;
+                  const dz = originalEmptyPos.z - anchorAtom.position.z;
+                  const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                  idealDir = len > 0.001 ? { x: dx / len, y: dy / len, z: dz / len } : { x: 1, y: 0, z: 0 };
+                } else {
+                  idealDir = { x: 1, y: 0, z: 0 };
+                }
+
+                // 旋转公团基团（B），使原子b的向外方向对准 A
+                if (idealDir) {
+                  const publicAtom = stateRef.current.molecule.atoms.find(a => a.id === publicAtomId);
+                  if (publicAtom) {
+                    // 找原子b的环邻居（排除锚点）
+                    const pBonds = stateRef.current.molecule.bonds.filter(
+                      b => (b.atom1Id === publicAtomId && b.atom2Id !== null && b.atom2Id !== anchorAtomId) ||
+                           (b.atom2Id === publicAtomId && b.atom1Id !== null && b.atom1Id !== anchorAtomId)
+                    );
+                    const ringNbrs = pBonds.map(b => b.atom1Id === publicAtomId ? b.atom2Id! : b.atom1Id!);
+                    if (ringNbrs.length >= 2) {
+                      const n1 = stateRef.current.molecule.atoms.find(a => a.id === ringNbrs[0]);
+                      const n2 = stateRef.current.molecule.atoms.find(a => a.id === ringNbrs[1]);
+                      if (n1 && n2) {
+                        // 当前向外方向 = 两个环邻居的向量和的反方向（指向环外）
+                        const sumDx = (n1.position.x - publicAtom.position.x) + (n2.position.x - publicAtom.position.x);
+                        const sumDy = (n1.position.y - publicAtom.position.y) + (n2.position.y - publicAtom.position.y);
+                        const sumDz = (n1.position.z - publicAtom.position.z) + (n2.position.z - publicAtom.position.z);
+                        const sumLen = Math.sqrt(sumDx * sumDx + sumDy * sumDy + sumDz * sumDz);
+                        if (sumLen > 0.001) {
+                          const currOutward = { x: -sumDx / sumLen, y: -sumDy / sumLen, z: -sumDz / sumLen };
+                          // 目标方向：从原子b指向A（与idealDir反向）
+                          const desiredDir = { x: -idealDir.x, y: -idealDir.y, z: -idealDir.z };
+                          // 计算旋转
+                          const cx = currOutward.y * desiredDir.z - currOutward.z * desiredDir.y;
+                          const cy = currOutward.z * desiredDir.x - currOutward.x * desiredDir.z;
+                          const cz = currOutward.x * desiredDir.y - currOutward.y * desiredDir.x;
+                          const cLen = Math.sqrt(cx * cx + cy * cy + cz * cz);
+                          const dot = currOutward.x * desiredDir.x + currOutward.y * desiredDir.y + currOutward.z * desiredDir.z;
+                          if (cLen > 0.001 && Math.abs(dot) < 0.999) {
+                            const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
+                            const axis = { x: cx / cLen, y: cy / cLen, z: cz / cLen };
+                            // BFS收集B的子树
+                            const bSubIds: string[] = [];
+                            const bVisited = new Set<string>([publicAtomId, anchorAtomId]);
+                            const bQueue = [publicAtomId];
+                            bVisited.add(publicAtomId);
+                            while (bQueue.length > 0) {
+                              const curId = bQueue.shift()!;
+                              bSubIds.push(curId);
+                              const curBonds = stateRef.current.molecule.bonds.filter(
+                                b => b.atom1Id === curId || b.atom2Id === curId
+                              );
+                              for (const bb of curBonds) {
+                                const otherEnd = bb.atom1Id === curId ? bb.atom2Id : bb.atom1Id;
+                                if (otherEnd !== null && !bVisited.has(otherEnd)) {
+                                  bVisited.add(otherEnd);
+                                  bQueue.push(otherEnd);
+                                }
+                              }
+                            }
+                            // 旋转所有子树原子
+                            const cosA = Math.cos(angle);
+                            const sinA = Math.sin(angle);
+                            for (const sid of bSubIds) {
+                              const sAtom = stateRef.current.molecule.atoms.find(a => a.id === sid);
+                              if (!sAtom) continue;
+                              const rx = sAtom.position.x - publicAtom.position.x;
+                              const ry = sAtom.position.y - publicAtom.position.y;
+                              const rz = sAtom.position.z - publicAtom.position.z;
+                              const pDot = rx * axis.x + ry * axis.y + rz * axis.z;
+                              const cx2 = axis.y * rz - axis.z * ry;
+                              const cy2 = axis.z * rx - axis.x * rz;
+                              const cz2 = axis.x * ry - axis.y * rx;
+                              sAtom.position = {
+                                x: publicAtom.position.x + rx * cosA + cx2 * sinA + axis.x * pDot * (1 - cosA),
+                                y: publicAtom.position.y + ry * cosA + cy2 * sinA + axis.y * pDot * (1 - cosA),
+                                z: publicAtom.position.z + rz * cosA + cz2 * sinA + axis.z * pDot * (1 - cosA),
+                              };
+                            }
+                            // 旋转子树中的空头键位置
+                            for (const sid of bSubIds) {
+                              const emptyBonds = stateRef.current.molecule.bonds.filter(
+                                b => (b.atom1Id === sid && b.atom2Id === null && b.atom2Position) ||
+                                     (b.atom2Id === sid && b.atom1Id === null && b.atom1Position)
+                              );
+                              for (const eb of emptyBonds) {
+                                let pos: { x: number; y: number; z: number } | null = null;
+                                let eKey: 'atom1Position' | 'atom2Position' | null = null;
+                                if (eb.atom1Id === sid && eb.atom2Id === null && eb.atom2Position) {
+                                  pos = eb.atom2Position; eKey = 'atom2Position';
+                                } else if (eb.atom2Id === sid && eb.atom1Id === null && eb.atom1Position) {
+                                  pos = eb.atom1Position; eKey = 'atom1Position';
+                                }
+                                if (pos && eKey) {
+                                  const rx = pos.x - publicAtom.position.x;
+                                  const ry = pos.y - publicAtom.position.y;
+                                  const rz = pos.z - publicAtom.position.z;
+                                  const pDot = rx * axis.x + ry * axis.y + rz * axis.z;
+                                  const cx2 = axis.y * rz - axis.z * ry;
+                                  const cy2 = axis.z * rx - axis.x * rz;
+                                  const cz2 = axis.x * ry - axis.y * rx;
+                                  const newPos = {
+                                    x: publicAtom.position.x + rx * cosA + cx2 * sinA + axis.x * pDot * (1 - cosA),
+                                    y: publicAtom.position.y + ry * cosA + cy2 * sinA + axis.y * pDot * (1 - cosA),
+                                    z: publicAtom.position.z + rz * cosA + cz2 * sinA + axis.z * pDot * (1 - cosA),
+                                  };
+                                  eb[eKey] = newPos;
+                                  updateBondPositionRef.current!(eb.id, { [eKey]: newPos });
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              } else {
+                // B 是母团（不动），A 是公团（移动）→ 从母团计算理想方向
+                publicAtomId = connectedAtomId;
+                anchorAtomId = snapTargetAtomId;
+                idealDir = calculateIdealBondDirection(stateRef.current.molecule, anchorAtomId, new Set([publicAtomId]));
+
+                // 旋转公团基团（A），使原子a的向外方向对准 B
+                if (idealDir) {
+                  const anchorAtom = stateRef.current.molecule.atoms.find(a => a.id === anchorAtomId);
+                  const publicAtom = stateRef.current.molecule.atoms.find(a => a.id === publicAtomId);
+                  if (publicAtom && anchorAtom) {
+                    const pBonds = stateRef.current.molecule.bonds.filter(
+                      b => (b.atom1Id === publicAtomId && b.atom2Id !== null && b.atom2Id !== anchorAtomId) ||
+                           (b.atom2Id === publicAtomId && b.atom1Id !== null && b.atom1Id !== anchorAtomId)
+                    );
+                    const ringNbrs = pBonds.map(b => b.atom1Id === publicAtomId ? b.atom2Id! : b.atom1Id!);
+                    if (ringNbrs.length >= 2) {
+                      const n1 = stateRef.current.molecule.atoms.find(a => a.id === ringNbrs[0]);
+                      const n2 = stateRef.current.molecule.atoms.find(a => a.id === ringNbrs[1]);
+                      if (n1 && n2) {
+                        const sumDx = (n1.position.x - publicAtom.position.x) + (n2.position.x - publicAtom.position.x);
+                        const sumDy = (n1.position.y - publicAtom.position.y) + (n2.position.y - publicAtom.position.y);
+                        const sumDz = (n1.position.z - publicAtom.position.z) + (n2.position.z - publicAtom.position.z);
+                        const sumLen = Math.sqrt(sumDx * sumDx + sumDy * sumDy + sumDz * sumDz);
+                        if (sumLen > 0.001) {
+                          const currOutward = { x: -sumDx / sumLen, y: -sumDy / sumLen, z: -sumDz / sumLen };
+                          const desiredDir = { x: -idealDir.x, y: -idealDir.y, z: -idealDir.z };
+                          const cx = currOutward.y * desiredDir.z - currOutward.z * desiredDir.y;
+                          const cy = currOutward.z * desiredDir.x - currOutward.x * desiredDir.z;
+                          const cz = currOutward.x * desiredDir.y - currOutward.y * desiredDir.x;
+                          const cLen = Math.sqrt(cx * cx + cy * cy + cz * cz);
+                          const dot = currOutward.x * desiredDir.x + currOutward.y * desiredDir.y + currOutward.z * desiredDir.z;
+                          if (cLen > 0.001 && Math.abs(dot) < 0.999) {
+                            const angle = Math.acos(Math.max(-1, Math.min(1, dot)));
+                            const axis = { x: cx / cLen, y: cy / cLen, z: cz / cLen };
+                            const aSubIds: string[] = [];
+                            const aVisited = new Set<string>([publicAtomId, anchorAtomId]);
+                            const aQueue = [publicAtomId];
+                            aVisited.add(publicAtomId);
+                            while (aQueue.length > 0) {
+                              const curId = aQueue.shift()!;
+                              aSubIds.push(curId);
+                              const curBonds = stateRef.current.molecule.bonds.filter(
+                                b => b.atom1Id === curId || b.atom2Id === curId
+                              );
+                              for (const bb of curBonds) {
+                                const otherEnd = bb.atom1Id === curId ? bb.atom2Id : bb.atom1Id;
+                                if (otherEnd !== null && !aVisited.has(otherEnd)) {
+                                  aVisited.add(otherEnd);
+                                  aQueue.push(otherEnd);
+                                }
+                              }
+                            }
+                            const cosA = Math.cos(angle);
+                            const sinA = Math.sin(angle);
+                            for (const sid of aSubIds) {
+                              const sAtom = stateRef.current.molecule.atoms.find(a => a.id === sid);
+                              if (!sAtom) continue;
+                              const rx = sAtom.position.x - publicAtom.position.x;
+                              const ry = sAtom.position.y - publicAtom.position.y;
+                              const rz = sAtom.position.z - publicAtom.position.z;
+                              const pDot = rx * axis.x + ry * axis.y + rz * axis.z;
+                              const cx2 = axis.y * rz - axis.z * ry;
+                              const cy2 = axis.z * rx - axis.x * rz;
+                              const cz2 = axis.x * ry - axis.y * rx;
+                              sAtom.position = {
+                                x: publicAtom.position.x + rx * cosA + cx2 * sinA + axis.x * pDot * (1 - cosA),
+                                y: publicAtom.position.y + ry * cosA + cy2 * sinA + axis.y * pDot * (1 - cosA),
+                                z: publicAtom.position.z + rz * cosA + cz2 * sinA + axis.z * pDot * (1 - cosA),
+                              };
+                            }
+                            for (const sid of aSubIds) {
+                              const emptyBonds = stateRef.current.molecule.bonds.filter(
+                                b => (b.atom1Id === sid && b.atom2Id === null && b.atom2Position) ||
+                                     (b.atom2Id === sid && b.atom1Id === null && b.atom1Position)
+                              );
+                              for (const eb of emptyBonds) {
+                                let pos: { x: number; y: number; z: number } | null = null;
+                                let eKey: 'atom1Position' | 'atom2Position' | null = null;
+                                if (eb.atom1Id === sid && eb.atom2Id === null && eb.atom2Position) {
+                                  pos = eb.atom2Position; eKey = 'atom2Position';
+                                } else if (eb.atom2Id === sid && eb.atom1Id === null && eb.atom1Position) {
+                                  pos = eb.atom1Position; eKey = 'atom1Position';
+                                }
+                                if (pos && eKey) {
+                                  const rx = pos.x - publicAtom.position.x;
+                                  const ry = pos.y - publicAtom.position.y;
+                                  const rz = pos.z - publicAtom.position.z;
+                                  const pDot = rx * axis.x + ry * axis.y + rz * axis.z;
+                                  const cx2 = axis.y * rz - axis.z * ry;
+                                  const cy2 = axis.z * rx - axis.x * rz;
+                                  const cz2 = axis.x * ry - axis.y * rx;
+                                  const newPos = {
+                                    x: publicAtom.position.x + rx * cosA + cx2 * sinA + axis.x * pDot * (1 - cosA),
+                                    y: publicAtom.position.y + ry * cosA + cy2 * sinA + axis.y * pDot * (1 - cosA),
+                                    z: publicAtom.position.z + rz * cosA + cz2 * sinA + axis.z * pDot * (1 - cosA),
+                                  };
+                                  eb[eKey] = newPos;
+                                  updateBondPositionRef.current!(eb.id, { [eKey]: newPos });
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+
+              // 1. 公团A刚体平移：按母团B理想方向放置A到标准键长
+              if (idealDir) {
+                adjustAtomPreserveSubtree(
+                  stateRef.current.molecule,
+                  publicAtomId,
+                  anchorAtomId,
+                  updateAtomPositionRef.current,
+                  updateBondPositionRef.current,
+                  idealDir
+                );
+              }
+              // 2. 公团A：只调整A上的H和空头键（排除B作为锚点）
+              optimizeGeometryAroundAtom(
+                stateRef.current.molecule,
+                publicAtomId,
+                updateAtomPositionRef.current,
+                updateBondPositionRef.current,
+                new Set([anchorAtomId])
+              );
+              // 3. 母团B：只调整B上的H和空头键（B的重原子不动，A保持姿态也不动）
+              optimizeGeometryAroundAtom(
+                stateRef.current.molecule,
+                anchorAtomId,
+                updateAtomPositionRef.current,
+                updateBondPositionRef.current,
+                new Set([publicAtomId])
+              );
+
+              // 拼接后刚性约束检查
+              validateMolecule(stateRef.current.molecule);
+            }, 50);
+          } else {
+          setTimeout(() => {
+            optimizeGeometryAroundAtom(
+              stateRef.current.molecule,
+              snapTargetAtomId,
+              updateAtomPositionRef.current,
+              updateBondPositionRef.current
+            );
+          }, 50);
+          }
+        }
+
+        // 清理吸附状态
+        interactionRef.current.endpointSnapTargetAtomId = null;
       }
 
       const rect = container.getBoundingClientRect();
@@ -4191,14 +4805,87 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
 
         if (intersection) {
           const targetPos = { x: intersection.x, y: intersection.y, z: intersection.z };
-          const safePos = calculateSafeAtomPosition(draggedAtomRef.current, targetPos);
-          addAtomRef.current(draggedAtomRef.current, safePos);
+          const symbol = draggedAtomRef.current;
+
+          // 检查附近是否有空闲价态的原子 → 自动成键
+          const nearbyResult = findNearbyAtomWithFreeValence(targetPos, stateRef.current.molecule);
+
+          if (nearbyResult.canSnap && nearbyResult.targetAtomId) {
+            const targetAtom = stateRef.current.molecule.atoms.find(a => a.id === nearbyResult.targetAtomId);
+            if (targetAtom) {
+              const bondLen = getStandardBondLength(symbol, targetAtom.symbol, 1);
+              const idealDir = calculateIdealBondDirection(stateRef.current.molecule, targetAtom.id);
+              if (idealDir) {
+                const newPos = {
+                  x: targetAtom.position.x + idealDir.x * bondLen,
+                  y: targetAtom.position.y + idealDir.y * bondLen,
+                  z: targetAtom.position.z + idealDir.z * bondLen,
+                };
+                addAtomRef.current(symbol, newPos);
+                // 等atom state更新后再创建键
+                setTimeout(() => {
+                  const atoms = stateRef.current.molecule.atoms;
+                  const newAtom = atoms[atoms.length - 1];
+                  if (newAtom) {
+                    addBondRef.current(targetAtom.id, newAtom.id, 1);
+                    // 优化键角键长
+                    setTimeout(() => {
+                      optimizeGeometryAroundAtom(
+                        stateRef.current.molecule, targetAtom.id,
+                        updateAtomPositionRef.current, updateBondPositionRef.current
+                      );
+                      optimizeGeometryAroundAtom(
+                        stateRef.current.molecule, newAtom.id,
+                        updateAtomPositionRef.current, updateBondPositionRef.current
+                      );
+                      validateMolecule(stateRef.current.molecule);
+                    }, 50);
+                  }
+                }, 50);
+              }
+            }
+          } else {
+            const safePos = calculateSafeAtomPosition(symbol, targetPos);
+            addAtomRef.current(symbol, safePos);
+          }
         }
         clearDragRef.current();
       } else if (draggedBondOrderRef.current && bondStartAtomRef.current) {
         const clickedAtomId = findAtomAtPosition(mouse);
         if (clickedAtomId && clickedAtomId !== bondStartAtomRef.current) {
           addBondRef.current(bondStartAtomRef.current, clickedAtomId, draggedBondOrderRef.current);
+        } else {
+          // 没有吸附到其他原子：在起始原子上创建一个按正确杂化方向的空头键
+          // 使用 calculateIdealBondDirection 计算新键方向（基于四面体性质：-(d1+d2+d3)）
+          const idealDir = calculateIdealBondDirection(
+            stateRef.current.molecule,
+            bondStartAtomRef.current
+          );
+          if (idealDir) {
+            const startAtom = stateRef.current.molecule.atoms.find(a => a.id === bondStartAtomRef.current);
+            if (startAtom) {
+              const bondLen = getStandardBondLength(startAtom.symbol, 'C', draggedBondOrderRef.current);
+              const emptyEndPos = {
+                x: startAtom.position.x + idealDir.x * bondLen,
+                y: startAtom.position.y + idealDir.y * bondLen,
+                z: startAtom.position.z + idealDir.z * bondLen,
+              };
+              // 创建空头键
+              addBondRef.current(bondStartAtomRef.current, null, draggedBondOrderRef.current, startAtom.position, emptyEndPos);
+
+              // 创建后优化：调整H和空头键的键角键长（重原子不动）
+              setTimeout(() => {
+                optimizeGeometryAroundAtom(
+                  stateRef.current.molecule,
+                  bondStartAtomRef.current!,
+                  updateAtomPositionRef.current,
+                  updateBondPositionRef.current
+                );
+                // 刚性约束检查
+                validateMolecule(stateRef.current.molecule);
+              }, 50);
+            }
+          }
         }
         clearDragRef.current();
       }
@@ -4241,29 +4928,36 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
       if (!interactionRef.current.isSingleBondDrag && interactionRef.current.draggedBondId && interactionRef.current.draggedBondEndpoint) {
         const bond = stateRef.current.molecule.bonds.find(b => b.id === interactionRef.current.draggedBondId);
         if (bond) {
-          const movingAtomId = interactionRef.current.draggedBondEndpoint === 'atom1' ? bond.atom1Id : bond.atom2Id;
-          if (movingAtomId === null) return;
-          const movingAtom = stateRef.current.molecule.atoms.find(a => a.id === movingAtomId);
-          if (movingAtom) {
-            const excludeIds = [];
-            if (bond.atom1Id !== null) excludeIds.push(bond.atom1Id);
-            if (bond.atom2Id !== null) excludeIds.push(bond.atom2Id);
-            const nearbyResult = findNearbyAtomWithFreeValence(
-              movingAtom.position, 
-              stateRef.current.molecule,
-              excludeIds
-            );
-            
-            if (nearbyResult.canSnap && nearbyResult.targetAtomId) {
-              // 检查这两个原子是否已经有键
-              const existingBond = stateRef.current.molecule.bonds.find(
-                b => (b.atom1Id === movingAtomId && b.atom2Id === nearbyResult.targetAtomId) ||
-                     (b.atom1Id === nearbyResult.targetAtomId && b.atom2Id === movingAtomId)
+          // 优先使用屏幕投影检测到的目标原子
+          const projectedTargetId = interactionRef.current.endpointSnapTargetAtomId;
+          if (projectedTargetId) {
+            // 绑定点已经由屏幕投影检测到，直接将此空头端绑定到目标原子
+            bindAtomToBondEndpointRef.current(bond.id, projectedTargetId, interactionRef.current.draggedBondEndpoint);
+          } else {
+            const movingAtomId = interactionRef.current.draggedBondEndpoint === 'atom1' ? bond.atom1Id : bond.atom2Id;
+            if (movingAtomId === null) return;
+            const movingAtom = stateRef.current.molecule.atoms.find(a => a.id === movingAtomId);
+            if (movingAtom) {
+              const excludeIds = [];
+              if (bond.atom1Id !== null) excludeIds.push(bond.atom1Id);
+              if (bond.atom2Id !== null) excludeIds.push(bond.atom2Id);
+              const nearbyResult = findNearbyAtomWithFreeValence(
+                movingAtom.position, 
+                stateRef.current.molecule,
+                excludeIds
               );
               
-              if (!existingBond) {
-                // 没有键的话，添加新键
-                addBondRef.current(movingAtomId, nearbyResult.targetAtomId, bond.order);
+              if (nearbyResult.canSnap && nearbyResult.targetAtomId) {
+                // 检查这两个原子是否已经有键
+                const existingBond = stateRef.current.molecule.bonds.find(
+                  b => (b.atom1Id === movingAtomId && b.atom2Id === nearbyResult.targetAtomId) ||
+                       (b.atom1Id === nearbyResult.targetAtomId && b.atom2Id === movingAtomId)
+                );
+                
+                if (!existingBond) {
+                  // 没有键的话，添加新键
+                  addBondRef.current(movingAtomId, nearbyResult.targetAtomId, bond.order);
+                }
               }
             }
           }
@@ -4274,15 +4968,96 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
       if (interactionRef.current.isSingleAtomDrag && interactionRef.current.draggedAtomId) {
         const atom = stateRef.current.molecule.atoms.find(a => a.id === interactionRef.current.draggedAtomId);
         if (atom) {
-          // 先检查是否有冲突
-          const hasCollision = checkSingleAtomCollision(interactionRef.current.draggedAtomId, atom.position);
+          // 检查整个连通分量是否有空间冲突
+          let hasCollision = false;
+          const origPos = interactionRef.current.singleAtomOriginalPosition;
+          // 只有确实发生了移动时才检查碰撞
+          const hasMoved = origPos && (
+            Math.abs(origPos.x - atom.position.x) > 0.001 ||
+            Math.abs(origPos.y - atom.position.y) > 0.001 ||
+            Math.abs(origPos.z - atom.position.z) > 0.001
+          );
+          
+          if (hasMoved) {
+            // 使用与 moveAtomWithConstraints 相同的碰撞检测逻辑
+            const allAtoms = stateRef.current.molecule.atoms;
+            const groupAtomIds = interactionRef.current.singleGroupAtomIds;
+            const groupSet = new Set(groupAtomIds);
+            const bondedPairs = new Set<string>();
+            for (const b of stateRef.current.molecule.bonds) {
+              if (b.atom1Id && b.atom2Id) {
+                bondedPairs.add(`${b.atom1Id}-${b.atom2Id}`);
+                bondedPairs.add(`${b.atom2Id}-${b.atom1Id}`);
+              }
+            }
+            for (const idA of groupAtomIds) {
+              const atomA = allAtoms.find(a => a.id === idA);
+              if (!atomA) continue;
+              const radiusA = ELEMENT_RADII[atomA.symbol] || CARBON_RADIUS;
+              for (const otherAtom of allAtoms) {
+                if (groupSet.has(otherAtom.id)) continue;
+                if (bondedPairs.has(`${idA}-${otherAtom.id}`)) continue;
+                const radiusB = ELEMENT_RADII[otherAtom.symbol] || CARBON_RADIUS;
+                const minDist = radiusA + radiusB + 0.2;
+                const dx = atomA.position.x - otherAtom.position.x;
+                const dy = atomA.position.y - otherAtom.position.y;
+                const dz = atomA.position.z - otherAtom.position.z;
+                const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+                if (dist < minDist && dist > 0.001) {
+                  hasCollision = true;
+                  break;
+                }
+              }
+              if (hasCollision) break;
+            }
+          }
           
           if (hasCollision) {
-            // 有冲突，回退到原始位置
-            updateAtomPositionRef.current(
-              interactionRef.current.draggedAtomId, 
-              interactionRef.current.singleAtomOriginalPosition
-            );
+            // 有冲突，从原始位置快照恢复整个连通分量
+            const origPositions = interactionRef.current.singleGroupOriginalPositions;
+            for (const [rid, rpos] of Object.entries(origPositions)) {
+              updateAtomPositionRef.current(rid, rpos);
+              const ra = stateRef.current.molecule.atoms.find(a => a.id === rid);
+              if (ra) ra.position = { ...rpos };
+            }
+            // 同时恢复空头键端点位置
+            const origEmptyPositions = interactionRef.current.rigidGroupEmptyBondPositions;
+            if (origEmptyPositions) {
+              for (const entry of Object.values(origEmptyPositions)) {
+                const eKey = entry.endpoint === 'atom1' ? 'atom1Position' : 'atom2Position';
+                const eb = stateRef.current.molecule.bonds.find(b => b.id === entry.bondId);
+                if (eb) {
+                  eb[eKey] = { ...entry.originalPosition };
+                  if (updateBondPositionRef.current) {
+                    updateBondPositionRef.current!(entry.bondId, { [eKey]: { ...entry.originalPosition } });
+                  }
+                }
+              }
+            }
+            // 立即更新 Three.js 网格位置
+            if (groupRef.current) {
+              for (const [rid, rpos] of Object.entries(origPositions)) {
+                for (const child of groupRef.current.children) {
+                  if (child.userData?.type === 'atom' && child.userData?.id === rid) {
+                    child.position.set(rpos.x, rpos.y, rpos.z);
+                    break;
+                  }
+                }
+              }
+              // 更新空头键端点 Three.js 网格
+              const restoredEmptyPositions = interactionRef.current.rigidGroupEmptyBondPositions;
+              if (restoredEmptyPositions && groupRef.current) {
+                for (const entry of Object.values(restoredEmptyPositions)) {
+                  for (const child of groupRef.current.children) {
+                    if (child.userData?.type === 'bondEndpoint' && child.userData?.id === entry.bondId &&
+                        child.userData?.end === entry.endpoint) {
+                      child.position.set(entry.originalPosition.x, entry.originalPosition.y, entry.originalPosition.z);
+                      break;
+                    }
+                  }
+                }
+              }
+            }
           } else {
             // 没有冲突，检查是否有吸附的目标
             
@@ -4322,25 +5097,69 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
                   interactionRef.current.snapTargetEndpoint
                 );
                 
-                // 拼接方案：公团（A=被拖拽原子）刚体平移到标准键长，母团（B=键另一端）只重排H和空头键
+                // 拼接方案：官能团规模大的做母团B（不动），规模小的做公团A（移动对齐）
                 const draggedAtomId = atom.id;
                 setTimeout(() => {
                   if (otherAtomId) {
-                    // 1. 公团A刚体平移：沿B→A方向移动A到标准键长，A的子树同步平移，检测冲突并旋转规避
+                    // 用BFS收集连通的原子数来衡量官能团规模
+                    const collectGroupSize = (startId: string, excludeId: string): number => {
+                      const visited = new Set<string>([excludeId, startId]);
+                      const queue = [startId];
+                      let count = 0;
+                      while (queue.length > 0) {
+                        const curId = queue.shift()!;
+                        count++;
+                        for (const b of stateRef.current.molecule.bonds) {
+                          const otherEnd = b.atom1Id === curId ? b.atom2Id : (b.atom2Id === curId ? b.atom1Id : null);
+                          if (otherEnd !== null && !visited.has(otherEnd)) {
+                            visited.add(otherEnd);
+                            queue.push(otherEnd);
+                          }
+                        }
+                      }
+                      return count;
+                    };
+                    const draggedSize = collectGroupSize(draggedAtomId, otherAtomId);
+                    const otherSize = collectGroupSize(otherAtomId, draggedAtomId);
+
+                    // 确定公团A（移动）和母团B（不动）
+                    let publicAtomId: string; // 公团A
+                    let anchorAtomId: string; // 母团B
+                    if (draggedSize >= otherSize) {
+                      // 被拖拽的官能团更大 → 做母团（不动）
+                      publicAtomId = otherAtomId;
+                      anchorAtomId = draggedAtomId;
+                    } else {
+                      // 默认：被拖拽的做公团（移动）
+                      publicAtomId = draggedAtomId;
+                      anchorAtomId = otherAtomId;
+                    }
+
+                    // 1. 公团A刚体平移：按母团B理想方向放置A到标准键长
+                    const idealDir = calculateIdealBondDirection(stateRef.current.molecule, anchorAtomId, new Set([publicAtomId]));
                     adjustAtomPreserveSubtree(
                       stateRef.current.molecule,
-                      draggedAtomId,
-                      otherAtomId,
-                      updateAtomPositionRef.current,
-                      updateBondPositionRef.current
-                    );
-                    // 2. 母团B：只重排H和空头键，重原子不动
-                    optimizeGeometryAroundAtom(
-                      stateRef.current.molecule,
-                      otherAtomId,
+                      publicAtomId,
+                      anchorAtomId,
                       updateAtomPositionRef.current,
                       updateBondPositionRef.current,
-                      new Set([draggedAtomId]) // 排除A，A不动
+                      idealDir
+                    );
+                    // 2. 公团A：只调整A上的H和空头键（排除B作为锚点）
+                    optimizeGeometryAroundAtom(
+                      stateRef.current.molecule,
+                      publicAtomId,
+                      updateAtomPositionRef.current,
+                      updateBondPositionRef.current,
+                      new Set([anchorAtomId])
+                    );
+                    // 3. 母团B：只调整B上的H和空头键（B的重原子不动，A保持姿态也不动）
+                    optimizeGeometryAroundAtom(
+                      stateRef.current.molecule,
+                      anchorAtomId,
+                      updateAtomPositionRef.current,
+                      updateBondPositionRef.current,
+                      new Set([publicAtomId])
                     );
                   } else {
                     optimizeGeometryAroundAtom(
@@ -4349,13 +5168,6 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
                       updateAtomPositionRef.current,
                       updateBondPositionRef.current
                     );
-                  }
-                  // 拼接后刚性约束检查日志
-                  const result = validateMolecule(stateRef.current.molecule);
-                  if (result.issues.length > 0) {
-                    result.issues.forEach((issue) => {
-                      console.log(`  [${issue.type}] ${issue.message}`);
-                    });
                   }
                 }, 50);
               }
@@ -4422,85 +5234,137 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
           
           // 如果吸附成功，优化目标原子周围的几何结构
           if (hasAdsorbed) {
-            // 拼接方案：公团（A=键另一端已连接原子）刚体平移，母团（B=吸附目标原子）只重排H和空头键
-            const targetAtoms = new Set<string>(); // B（母团）
+            // 拼接方案：公团（A）刚体平移，母团（B）只重排H和空头键
+            // 规则：键数多的原子做母团（保持不动），键数少的做公团（移动对齐）
+            const snapTargetAtoms = new Set<string>(); // 吸附目标
             if (interactionRef.current.snapTarget1) {
-              targetAtoms.add(interactionRef.current.snapTarget1.atomId);
+              snapTargetAtoms.add(interactionRef.current.snapTarget1.atomId);
             }
             if (interactionRef.current.snapTarget2) {
-              targetAtoms.add(interactionRef.current.snapTarget2.atomId);
+              snapTargetAtoms.add(interactionRef.current.snapTarget2.atomId);
             }
-            const otherAtoms = new Set<string>(); // A（公团）
-            if (bond.atom1Id) otherAtoms.add(bond.atom1Id);
-            if (bond.atom2Id) otherAtoms.add(bond.atom2Id);
+            const bondConnectedAtoms = new Set<string>(); // 键上已连接的原子
+            if (bond.atom1Id) bondConnectedAtoms.add(bond.atom1Id);
+            if (bond.atom2Id) bondConnectedAtoms.add(bond.atom2Id);
+
+            // 判断公团/母团角色：官能团规模大的做母团B（不动），规模小的做公团A（移动）
+            // 用整个官能团的原子数衡量规模（通过BFS收集连通的原子）
+            let targetAtoms: Set<string>; // B（母团，不动）
+            let otherAtoms: Set<string>; // A（公团，移动）
+            const collectGroupSize = (startAtomId: string, excludeIds: Set<string>): number => {
+              const visited = new Set<string>(excludeIds);
+              const queue = [startAtomId];
+              visited.add(startAtomId);
+              let count = 0;
+              while (queue.length > 0) {
+                const currentId = queue.shift()!;
+                count++;
+                const bondsOfAtom = stateRef.current.molecule.bonds.filter(b => b.atom1Id === currentId || b.atom2Id === currentId);
+                for (const b of bondsOfAtom) {
+                  const otherEnd = b.atom1Id === currentId ? b.atom2Id : b.atom1Id;
+                  if (otherEnd !== null && !visited.has(otherEnd)) {
+                    visited.add(otherEnd);
+                    queue.push(otherEnd);
+                  }
+                }
+              }
+              return count;
+            };
+            const snapGroupSize = Array.from(snapTargetAtoms).reduce((sum, id) => sum + collectGroupSize(id, new Set<string>()), 0);
+            const connectedGroupSize = Array.from(bondConnectedAtoms).reduce((sum, id) => sum + collectGroupSize(id, new Set<string>()), 0);
+            if (connectedGroupSize >= snapGroupSize) {
+              // 键上已连接原子的官能团更大 → 做母团（不动）
+              targetAtoms = bondConnectedAtoms;
+              otherAtoms = snapTargetAtoms;
+            } else {
+              // 默认：吸附目标的官能团更大 → 做母团
+              targetAtoms = snapTargetAtoms;
+              otherAtoms = bondConnectedAtoms;
+            }
             setTimeout(() => {
-              // 1. 公团A刚体平移：沿B→A方向移动A到标准键长，检测冲突并旋转规避
+              // 1. 公团A刚体平移：按母团B理想方向放置A到标准键长，检测冲突并旋转规避
               for (const atomId of otherAtoms) {
                 if (!targetAtoms.has(atomId)) {
+                  // 找到公团A中该原子在母团B中的锚点（通过键连接的母团原子）
                   let anchorId: string | null = null;
-                  if (interactionRef.current.snapTarget1 && bond.atom1Id === atomId) {
-                    anchorId = interactionRef.current.snapTarget1.atomId;
-                  } else if (interactionRef.current.snapTarget2 && bond.atom2Id === atomId) {
-                    anchorId = interactionRef.current.snapTarget2.atomId;
-                  } else {
+                  const bondsOfAtom = stateRef.current.molecule.bonds.filter(b => b.atom1Id === atomId || b.atom2Id === atomId);
+                  for (const b of bondsOfAtom) {
+                    const otherEnd = b.atom1Id === atomId ? b.atom2Id : b.atom1Id;
+                    if (otherEnd !== null && targetAtoms.has(otherEnd)) {
+                      anchorId = otherEnd;
+                      break;
+                    }
+                  }
+                  if (!anchorId) {
                     anchorId = targetAtoms.values().next().value || null;
                   }
                   if (anchorId) {
+                    // 计算母团B上新键的理想接入方向
+                    // 排除公团原子（otherAtoms），因为它们是新键已连接的原子，方向还未确定
+                    const idealDir = calculateIdealBondDirection(stateRef.current.molecule, anchorId, otherAtoms);
                     adjustAtomPreserveSubtree(
                       stateRef.current.molecule,
                       atomId,
                       anchorId,
                       updateAtomPositionRef.current,
-                      updateBondPositionRef.current
+                      updateBondPositionRef.current,
+                      idealDir
                     );
                   }
                 }
               }
-              // 2. 母团B：只重排H和空头键，重原子不动
+              // 2. 公团A：调整A上的H和空头键的键角键长（A本身不动，排除B）
+              for (const atomId of otherAtoms) {
+                if (!targetAtoms.has(atomId)) {
+                  optimizeGeometryAroundAtom(
+                    stateRef.current.molecule,
+                    atomId,
+                    updateAtomPositionRef.current,
+                    updateBondPositionRef.current,
+                    targetAtoms // 排除B，B不动
+                  );
+                }
+              }
+              // 3. 母团B：只调整B上的H和空头键（B的重原子不动，公团A保持姿态也不动）
               for (const atomId of targetAtoms) {
                 optimizeGeometryAroundAtom(
                   stateRef.current.molecule,
                   atomId,
                   updateAtomPositionRef.current,
                   updateBondPositionRef.current,
-                  otherAtoms // 排除A，A不动
+                  otherAtoms // 排除公团原子，它们保持姿态不动
                 );
-              }
-              // 拼接后刚性约束检查日志
-              const result = validateMolecule(stateRef.current.molecule);
-              if (result.issues.length > 0) {
-                result.issues.forEach((issue) => {
-                  console.log(`  [${issue.type}] ${issue.message}`);
-                });
               }
             }, 50);
           }
           
           // 如果没有吸附，检查是否有冲突并回退
           if (!hasAdsorbed) {
-            const atom1 = bond.atom1Id !== null ? stateRef.current.molecule.atoms.find(a => a.id === bond.atom1Id) : null;
-            const atom2 = bond.atom2Id !== null ? stateRef.current.molecule.atoms.find(a => a.id === bond.atom2Id) : null;
-            
-            // 检查冲突，只有两个都是真实原子时才检查
-            if (atom1 && atom2) {
-              const hasCollision = checkSingleBondCollision(
-                interactionRef.current.draggedBondId,
-                atom1.position,
-                atom2.position
-              );
+            // 收集刚性基团所有原子ID
+            const rigidOrig = interactionRef.current.rigidGroupOriginalPositions;
+            const rigidIds = Object.keys(rigidOrig);
+            if (rigidIds.length > 0) {
+              // 检查整个刚性基团是否有碰撞
+              const hasCollision = checkRigidGroupCollision(rigidIds);
               
               if (hasCollision) {
-                // 有冲突，回退到原始位置
-                if (bond.atom1Id !== null) {
-                  updateAtomPositionRef.current(bond.atom1Id, interactionRef.current.bondOriginalAtom1Position);
-                } else if (bond.atom1Position) {
-                  updateBondPositionRef.current!(bond.id, { atom1Position: interactionRef.current.bondOriginalAtom1Position });
+                // 回退整个刚性基团到原始位置
+                for (const [rid, rpos] of Object.entries(rigidOrig)) {
+                  updateAtomPositionRef.current(rid, rpos);
+                  const ra = stateRef.current.molecule.atoms.find(a => a.id === rid);
+                  if (ra) ra.position = { ...rpos };
                 }
-                
-                if (bond.atom2Id !== null) {
-                  updateAtomPositionRef.current(bond.atom2Id, interactionRef.current.bondOriginalAtom2Position);
-                } else if (bond.atom2Position) {
-                  updateBondPositionRef.current!(bond.id, { atom2Position: interactionRef.current.bondOriginalAtom2Position });
+                // 立即更新 Three.js 网格位置
+                if (groupRef.current) {
+                  const children = groupRef.current.children;
+                  for (const [rid, rpos] of Object.entries(rigidOrig)) {
+                    for (const child of children) {
+                      if (child.userData?.type === 'atom' && child.userData?.id === rid) {
+                        child.position.set(rpos.x, rpos.y, rpos.z);
+                        break;
+                      }
+                    }
+                  }
                 }
               }
             }
@@ -4528,6 +5392,7 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
       interactionRef.current.rotationAxis = null;
       // 只清理拖拽状态，保留键端小球的选中态（变绿后持续保持）
       interactionRef.current.bondEndpointIsDragging = false;
+      interactionRef.current.endpointSnapTargetAtomId = null;
     };
 
     let lastPinchDist = 0;
@@ -4696,13 +5561,22 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
     window.addEventListener('resize', handleResize);
 
     const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
       if (event.key === 'Delete' || event.key === 'Backspace') {
-        if (stateRef.current.selectedBond) {
-          removeBondRef.current(stateRef.current.selectedBond);
-          selectBondRef.current(null);
-        } else if (stateRef.current.selectedAtom) {
+        event.preventDefault();
+        if (stateRef.current.selectedAtom) {
           removeAtomRef.current(stateRef.current.selectedAtom);
           selectAtomRef.current(null);
+          setGyroSelectedAtomId(null);
+        } else if (stateRef.current.selectedBond) {
+          removeBondRef.current(stateRef.current.selectedBond);
+          selectBondRef.current(null);
+          setGyroSelectedAtomId(null);
+        } else if (stateRef.current.selectedAtoms.length > 0) {
+          stateRef.current.selectedAtoms.forEach(id => removeAtomRef.current(id));
+          selectAtomRef.current(null);
+          setGyroSelectedAtomId(null);
+          updateSelectedAtomsRef.current([]);
         }
       } else if (event.key === 'Escape') {
         selectAtomRef.current(null);
@@ -4739,20 +5613,13 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
 
   // 分离的useEffect 2: 更新分子显示（状态变化时调用，不重新创建场景）
   useEffect(() => {
+    if (!groupRef.current) return;
     updateMoleculeDisplay();
   }, [state.molecule, state.selectedAtom, state.selectedBond, state.selectedAtoms, showLabels, updateMoleculeDisplay]);
 
   useEffect(() => {
-    window.dispatchEvent(new CustomEvent('selectAtom', { detail: { atomId: gyroSelectedAtomId } }));
-  }, [gyroSelectedAtomId]);
-
-  useEffect(() => {
-    window.dispatchEvent(new CustomEvent('moleculeChange', { detail: { atoms: state.molecule.atoms } }));
+    setShowGyroscopeRotation(false);
   }, [state.molecule]);
-
-  useEffect(() => {
-    window.dispatchEvent(new CustomEvent('darkModeChange', { detail: { isDarkMode } }));
-  }, [isDarkMode]);
 
   // 监听 cameraSpherical 变化并更新相机位置
   useEffect(() => {
@@ -4791,10 +5658,8 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
     }
     updateCameraFromSpherical();
     stopRotationAnimation();
+    setShowGyroscopeRotation(false);
     setGyroscopeResetKey(k => k + 1);
-    window.dispatchEvent(new CustomEvent('resetGyro'));
-    // 恢复100%缩放
-    setZoomLevel(100);
   };
 
   // 切换视角到指定方向
@@ -4849,19 +5714,8 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
     updateGroupQuaternion();
     updateCameraFromSpherical();
     stopRotationAnimation();
+    setShowGyroscopeRotation(false);
   };
-
-  // 监听万向仪方向按钮事件
-  useEffect(() => {
-    const handleViewDirEvent = (e: Event) => {
-      const direction = (e as CustomEvent).detail as 'east' | 'west' | 'up' | 'down' | 'south' | 'north';
-      handleViewDirection(direction);
-    };
-    window.addEventListener('viewDirection', handleViewDirEvent);
-    return () => {
-      window.removeEventListener('viewDirection', handleViewDirEvent);
-    };
-  }, []);
 
   const resetGroupRotation = () => {
     if (!groupRef.current || !state.molecule.atoms.length) return;
@@ -4939,11 +5793,9 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
                 )}
               </button>
               <button
-                onClick={() => {
-                  window.dispatchEvent(new CustomEvent('showGyroRotation', { detail: { show: !showRotation } }));
-                }}
+                onClick={() => setShowGyroscopeRotation(!showGyroscopeRotation)}
                 className={`bg-gray-800/80 hover:bg-gray-700/80 transition-colors flex items-center justify-center ${
-                  showRotation ? 'text-blue-600' : 'text-white'
+                  showGyroscopeRotation ? 'text-blue-600' : 'text-white'
                 }`}
                 title="万向仪"
                 style={{ width: '42px', height: '42px', fontSize: '22px' }}
@@ -4953,16 +5805,36 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
             </>
           )}
         </div>
-        {/* 折叠/展开按钮 */}
         <button
           onClick={() => setToolbarCollapsed(!toolbarCollapsed)}
-          className="bg-gray-800/80 hover:bg-gray-700 text-white transition-colors flex items-center justify-center"
-          title={toolbarCollapsed ? '展开工具栏' : '收起工具栏'}
-          style={{ width: '42px', height: '16px', fontSize: '10px', borderRadius: '0 0 6px 6px' }}
+          className="bg-gray-800/80 hover:bg-gray-700/80 text-white rounded-lg transition-colors flex items-center justify-center text-xs mt-1"
+          title={toolbarCollapsed ? '展开' : '收起'}
+          style={{ width: '42px', height: '28px' }}
         >
-          {toolbarCollapsed ? '⋁' : '⋀'}
+          {toolbarCollapsed ? '▼' : '▲'}
         </button>
       </div>
+
+      {/* 万向仪 - 左下角 */}
+      {showGyroscopeRotation && (
+        <div style={{ position: 'absolute', left: 'max(10px, env(safe-area-inset-left, 10px))', bottom: 'max(10px, env(safe-area-inset-bottom, 10px))' }}>
+          <Gyroscope 
+            sphericalRef={cameraSphericalRef}
+            viewQuaternionRef={viewQuaternionRef}
+            isDarkMode={isDarkMode} 
+            showRotation={showGyroscopeRotation}
+            resetKey={gyroscopeResetKey}
+            onViewDirection={handleViewDirection}
+            selectedAtomId={gyroSelectedAtomId}
+            moleculeAtoms={state.molecule.atoms}
+            moleculeRotationRef={moleculeRotationRef}
+            moleculeGroupRef={groupRef as React.MutableRefObject<THREE.Group | null>}
+          />
+        </div>
+      )}
+
+
+
 
 
     </div>

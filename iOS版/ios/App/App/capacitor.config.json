@@ -1,0 +1,16 @@
+{
+  "appId": "com.molecule.molecularwander",
+  "appName": "MolecularWander",
+  "webDir": "public",
+  "ios": {
+    "contentInset": "never",
+    "preferredContentMode": "mobile",
+    "allowsLinkPreview": false,
+    "scrollEnabled": true,
+    "backgroundColor": "#0a0a0a"
+  },
+  "server": {
+    "androidScheme": "https",
+    "iosScheme": "capacitor"
+  }
+}

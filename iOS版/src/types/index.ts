@@ -9,7 +9,7 @@ export interface Atom {
   symbol: string;
   position: Vector3;
   atomicNumber: number;
-  hybridization?: 'sp' | 'sp2' | 'sp3';
+  hybridization?: 'sp' | 'sp2' | 'sp3' | 'sp3d' | 'sp3d2' | 'sp3d3';
   color?: string;
   radius?: number;
 }
@@ -88,6 +88,9 @@ export interface HybridizationAnalysis {
   sp: string[];
   sp2: string[];
   sp3: string[];
+  sp3d: string[];
+  sp3d2: string[];
+  sp3d3: string[];
 }
 
 export interface CollinearityResult {

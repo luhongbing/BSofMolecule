@@ -1,23 +1,22 @@
 import { useRef, useEffect, useMemo, useState } from 'react';
 import * as THREE from 'three';
-import { useGyroscope } from '../context/GyroscopeContext';
 
 type AxisDirection = 'east' | 'west' | 'up' | 'down' | 'south' | 'north';
 
-export function Gyroscope() {
-  const {
-    sphericalRef,
-    viewQuaternionRef,
-    showRotation,
-    resetKey,
-    selectedAtomId,
-    moleculeAtoms,
-    moleculeRotationRef,
-    moleculeGroupRef,
-    onViewDirection,
-    isDarkMode,
-  } = useGyroscope();
-  
+interface GyroscopeProps {
+  sphericalRef: React.MutableRefObject<{ theta: number; phi: number; radius: number }>;
+  viewQuaternionRef: React.MutableRefObject<THREE.Quaternion>;
+  isDarkMode: boolean;
+  showRotation: boolean;
+  resetKey?: number; // 改变时重置按钮状态
+  onViewDirection?: (direction: AxisDirection) => void;
+  selectedAtomId?: string | null;
+  moleculeAtoms?: { id: string; symbol: string; position: { x: number; y: number; z: number } }[];
+  moleculeRotationRef?: React.MutableRefObject<THREE.Quaternion>;
+  moleculeGroupRef?: React.MutableRefObject<THREE.Group | null>;
+}
+
+export function Gyroscope({ sphericalRef, viewQuaternionRef, isDarkMode, onViewDirection, resetKey, selectedAtomId, moleculeAtoms, moleculeRotationRef, moleculeGroupRef }: GyroscopeProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.Camera | null>(null);
@@ -30,7 +29,7 @@ export function Gyroscope() {
   const atomCoordDisplayRef = useRef<HTMLDivElement>(null);
   
   const cameraSphericalRef = sphericalRef;
-  const isDarkModeRef = useRef(true);
+  const isDarkModeRef = useRef(isDarkMode);
   const selectedAtomIdRef = useRef(selectedAtomId);
   const moleculeAtomsRef = useRef(moleculeAtoms);
   const moleculeRotationRefRef = useRef(moleculeRotationRef);
@@ -78,15 +77,15 @@ export function Gyroscope() {
     const x = direction.x;
     const y = direction.y;
     const z = direction.z;
-
+    
     const absX = Math.abs(x);
     const absY = Math.abs(y);
     const absZ = Math.abs(z);
-
+    
     let mainDirection = '';
     let horizontalDeviation = 0;
     let verticalDeviation = 0;
-
+    
     if (absX >= absY && absX >= absZ) {
       mainDirection = x < 0 ? '东' : '西';
       horizontalDeviation = Math.atan2(Math.abs(z), Math.abs(x)) * (180 / Math.PI);
@@ -100,7 +99,7 @@ export function Gyroscope() {
       horizontalDeviation = Math.atan2(Math.abs(x), Math.abs(y)) * (180 / Math.PI);
       verticalDeviation = Math.atan2(Math.abs(z), Math.abs(y)) * (180 / Math.PI);
     }
-
+    
     let horizontalBias = '';
     if (mainDirection !== '东' && mainDirection !== '西') {
       horizontalBias = x < 0 ? '偏东' : '偏西';
@@ -109,17 +108,17 @@ export function Gyroscope() {
     }
 
     let verticalBias = y > 0 ? '偏上' : '偏下';
-
+    
     if (mainDirection === '上' || mainDirection === '下') {
       if (Math.abs(x) > Math.abs(z)) {
         horizontalBias = x < 0 ? '偏东' : '偏西';
       } else {
         horizontalBias = z > 0 ? '偏南' : '偏北';
       }
-      return `${mainDirection}，${horizontalBias}${horizontalDeviation.toFixed(0)}°；`;
+      return `方向：${mainDirection}，${horizontalBias}${horizontalDeviation.toFixed(0)}°`;
     }
-
-    return `${mainDirection}，${horizontalBias}${horizontalDeviation.toFixed(0)}°，${verticalBias}${verticalDeviation.toFixed(0)}°；`;
+    
+    return `方向：${mainDirection}，${horizontalBias}${horizontalDeviation.toFixed(0)}°，${verticalBias}${verticalDeviation.toFixed(0)}°`;
   };
 
   useEffect(() => {
@@ -283,7 +282,7 @@ export function Gyroscope() {
               // 找原子编号
               const atomIndex = currentMoleculeAtoms.findIndex(a => a.id === currentSelectedAtomId);
               atomCoordDisplayRef.current.textContent =
-                `${atomIndex}号${atom.symbol}（${worldPos.x.toFixed(2)}，${worldPos.y.toFixed(2)}，${worldPos.z.toFixed(2)}）`;
+                `坐标：${atomIndex}号${atom.symbol}原子（${worldPos.x.toFixed(2)}，${worldPos.y.toFixed(2)}，${worldPos.z.toFixed(2)}）`;
             } else {
               atomCoordDisplayRef.current.textContent = '';
             }
@@ -364,89 +363,84 @@ export function Gyroscope() {
   const defaultBg = isDarkMode ? 'rgba(255,255,255,0.08)' : 'rgba(0,0,0,0.05)';
   const defaultColor = isDarkMode ? '#ccc' : '#555';
 
-  return useMemo(() => {
-    return (
-      <div className="relative" style={{ width: '160px', maxWidth: '320px' }}>
+  return useMemo(() => (
+    <div className="relative" style={{ width: '160px' }}>
       <div
         ref={containerRef}
         style={{
-          width: showRotation ? '120px' : '0px',
-          height: showRotation ? '120px' : '0px',
+          width: '120px',
+          height: '120px',
           border: isDarkMode ? '2px solid #444' : '2px solid #ccc',
           borderRadius: '8px',
           overflow: 'hidden',
           pointerEvents: 'none',
-          opacity: showRotation ? 1 : 0,
-          transition: 'opacity 0.15s',
         }}
       />
-      {/* 方向标签 + 方向/坐标显示 - 同一行 */}
-      <div style={{
-        display: 'flex',
-        alignItems: 'center',
-        gap: '8px',
+      {/* 方向标签 - 万向仪外部上方 */}
+      <div style={{ 
+        display: 'flex', 
+        gap: '4px', 
         marginTop: '4px',
+        width: '120px',
       }}>
-        <div style={{
+        {axisConfig.map(({ axis, getLabel, hoverColor, activeColor }) => {
+          const isActive = activeAxis === axis;
+          return (
+            <div
+              key={axis}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                width: `${btnWidth}px`,
+                height: '22px',
+                fontSize: '12px',
+                fontWeight: 'bold',
+                color: isActive ? '#fff' : defaultColor,
+                backgroundColor: isActive ? activeColor : defaultBg,
+                border: isActive ? `1px solid ${activeColor}` : '1px solid transparent',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                userSelect: 'none',
+                transition: 'all 0.15s',
+              }}
+              onClick={() => handleAxisClick(axis)}
+              onMouseEnter={(e) => {
+                if (!isActive) {
+                  e.currentTarget.style.borderColor = hoverColor;
+                }
+              }}
+              onMouseLeave={(e) => {
+                if (!isActive) {
+                  e.currentTarget.style.borderColor = 'transparent';
+                }
+              }}
+            >
+              {getLabel()}
+            </div>
+          );
+        })}
+      </div>
+      {/* 方向与坐标显示 - 万向仪框外右侧，与三个按钮中心对齐 */}
+      <div
+        style={{
+          position: 'absolute',
+          top: '126px',
+          left: '124px',
           display: 'flex',
-          gap: '4px',
-          flexShrink: 0,
-        }}>
-          {axisConfig.map(({ axis, getLabel, hoverColor, activeColor }) => {
-            const isActive = activeAxis === axis;
-            return (
-              <div
-                key={axis}
-                style={{
-                  display: 'inline-flex',
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  width: `${btnWidth}px`,
-                  height: '22px',
-                  fontSize: '12px',
-                  fontWeight: 'bold',
-                  color: isActive ? '#fff' : defaultColor,
-                  backgroundColor: isActive ? activeColor : defaultBg,
-                  border: isActive ? `1px solid ${activeColor}` : '1px solid transparent',
-                  borderRadius: '4px',
-                  cursor: 'pointer',
-                  userSelect: 'none',
-                  transition: 'all 0.15s',
-                }}
-                onClick={() => handleAxisClick(axis)}
-                onMouseEnter={(e) => {
-                  if (!isActive) {
-                    e.currentTarget.style.borderColor = hoverColor;
-                  }
-                }}
-                onMouseLeave={(e) => {
-                  if (!isActive) {
-                    e.currentTarget.style.borderColor = 'transparent';
-                  }
-                }}
-              >
-                {getLabel()}
-              </div>
-            );
-          })}
-        </div>
-        <div
-          style={{
-            display: 'flex',
-            alignItems: 'center',
-            height: '22px',
-            fontSize: '12px',
-            fontWeight: 'bold',
-            color: '#909090',
-            fontFamily: 'monospace',
-            whiteSpace: 'nowrap',
-            gap: '8px',
-          }}
-        >
-          <span ref={directionDisplayRef}>南向，偏东0°，偏下0°；</span>
-          <span ref={atomCoordDisplayRef} />
-        </div>
+          alignItems: 'center',
+          height: '22px',
+          fontSize: '12px',
+          fontWeight: 'bold',
+          color: '#909090',
+          fontFamily: 'monospace',
+          whiteSpace: 'nowrap',
+          gap: '12px',
+        }}
+      >
+        <span ref={directionDisplayRef}>&nbsp;&nbsp;方向：南向，偏东0°，偏下0°</span>
+        <span ref={atomCoordDisplayRef} />
       </div>
     </div>
-  );}, [isDarkMode, onViewDirection, axisDirection, activeAxis, selectedAtomId, moleculeAtoms, moleculeRotationRef, showRotation]);
+  ), [isDarkMode, onViewDirection, axisDirection, activeAxis, selectedAtomId, moleculeAtoms, moleculeRotationRef]);
 }

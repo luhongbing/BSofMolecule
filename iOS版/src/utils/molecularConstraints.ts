@@ -179,7 +179,7 @@ export function calculateImplicitHydrogens(
 export function getHybridization(
   atom: ParsedAtom, 
   bondOrders: Map<string, Map<string, number>>
-): 'sp' | 'sp2' | 'sp3' {
+): 'sp' | 'sp2' | 'sp3' | 'sp3d' | 'sp3d2' | 'sp3d3' {
   const neighbors = atom.bonds.size;
   const totalBondOrder = Array.from(atom.bonds.entries())
     .reduce((sum, [nId, order]) => sum + order, 0);
@@ -212,7 +212,16 @@ export function getHybridization(
     return 'sp3';
   }
 
+  if (atom.symbol === 'Cl' || atom.symbol === 'Br' || atom.symbol === 'I' || atom.symbol === 'P' || atom.symbol === 'S') {
+    if (neighbors >= 7) return 'sp3d3';
+    if (neighbors === 6) return 'sp3d2';
+    if (neighbors === 5) return 'sp3d';
+  }
+
   // 其他原子
+  if (neighbors >= 7) return 'sp3d3';
+  if (neighbors === 6) return 'sp3d2';
+  if (neighbors === 5) return 'sp3d';
   if (maxBondOrder >= 3) return 'sp';
   if (maxBondOrder >= 2) return 'sp2';
   return 'sp3';

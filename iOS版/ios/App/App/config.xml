@@ -1,0 +1,12 @@
+<?xml version='1.0' encoding='utf-8'?>
+<widget id="com.molecule.molecularwander" version="1.0.0" xmlns="http://www.w3.org/ns/widgets" xmlns:cdv="http://cordova.apache.org/ns/1.0">
+    <name>MolecularWander</name>
+    <description>交互式3D分子编辑器</description>
+    <author email="dev@example.com" href="https://example.com">Developer</author>
+    <content src="index.html" />
+    <access origin="*" />
+    <preference name="ScrollEnabled" value="true" />
+    <preference name="BackgroundColor" value="#0a0a0a" />
+    <preference name="AllowLinkPreview" value="false" />
+    <preference name="PreferredContentMode" value="mobile" />
+</widget>

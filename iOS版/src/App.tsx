@@ -1,11 +1,9 @@
 import { useRef, useEffect, useState, useCallback } from 'react';
 import { MoleculeProvider } from './context/MoleculeContext';
 import { DragProvider } from './context/DragContext';
-import { GyroscopeProvider } from './context/GyroscopeContext';
 import { Toolbar } from './components/Toolbar';
 import { Canvas3D } from './components/Canvas3D';
 import { AnalysisPanel } from './components/AnalysisPanel';
-import { Gyroscope } from './components/Gyroscope';
 import { SmilesSearchPage } from './components/SmilesSearchPage';
 import { AtomSelectPage } from './components/AtomSelectPage';
 
@@ -284,17 +282,6 @@ function AppInner() {
         <Canvas3D toolbarHeight={toolbarHeight} />
         <AnalysisPanel toolbarHeight={toolbarHeight} />
       </div>
-      {/* 万向仪 - 左下角，使用 absolute 定位，相对于根容器 */}
-      <div
-        style={{
-          position: 'absolute',
-          left: 'max(10px, env(safe-area-inset-left, 10px))',
-          bottom: 'max(10px, env(safe-area-inset-bottom, 10px))',
-          zIndex: 10
-        }}
-      >
-        <Gyroscope />
-      </div>
       {/* TopBar - 叠加在 Canvas 上方 */}
       <div ref={toolbarRef} className="absolute top-0 left-0 right-0 z-20">
         <TopBar />
@@ -310,9 +297,7 @@ function App() {
   return (
     <MoleculeProvider>
       <DragProvider>
-        <GyroscopeProvider>
-          <AppInner />
-        </GyroscopeProvider>
+        <AppInner />
       </DragProvider>
     </MoleculeProvider>
   );

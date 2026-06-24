@@ -114,8 +114,7 @@ export function StatusBar() {
                 onChange={handleInputChange}
                 onBlur={handleInputBlur}
                 onClick={() => setShowDropdown(!showDropdown)}
-                className="w-20 bg-gray-700 text-white pl-2 pr-5 py-1 rounded border border-gray-600 hover:border-gray-500 focus:border-blue-500 focus:outline-none cursor-pointer"
-                style={{ fontSize: '16px' }}
+                className="w-20 bg-gray-700 text-white text-sm pl-2 pr-5 py-1 rounded border border-gray-600 hover:border-gray-500 focus:border-blue-500 focus:outline-none cursor-pointer"
               />
               <span className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 pointer-events-none">%</span>
 

@@ -242,3 +242,45 @@ export function getDefaultValence(symbol: string): number {
 export function isElement(symbol: string): boolean {
   return ELEMENTS_SET.has(symbol);
 }
+
+/**
+ * 获取元素稳定所需的最少 sigma 键数
+ * 低于此数时，原子需形成 π 键来稳定 → sp²/sp (非 sp³)
+ * 等于此数时，原子有孤对电子填充 → sp³
+ *
+ * 例如：
+ *   C: valences=[4],  stableSigmaBonds=4  → 3个键需 π(sp²)，4个键 sp³
+ *   N: valences=[3,5], stableSigmaBonds=3  → 2个键需 π(sp²)，3个键 sp³
+ *   O: valences=[2],   stableSigmaBonds=2  → 2个键即达稳定 sp³
+ */
+export function getStableSigmaBonds(symbol: string): number {
+  const elem = ELEMENT_MAP.get(symbol);
+  if (!elem || elem.valences.length === 0) return 4;
+  return Math.min(...elem.valences);
+}
+
+/**
+ * 获取元素的最大价键数
+ * 用于判断是否为扩展八隅体原子（S/P等）
+ */
+export function getMaxValence(symbol: string): number {
+  const elem = ELEMENT_MAP.get(symbol);
+  if (!elem || elem.valences.length === 0) return 4;
+  return Math.max(...elem.valences);
+}
+
+/**
+ * 判断元素是否使用 d 轨道参与 π 成键（即是否可扩展八隅体）
+ * 决定：含有双/三键时，sigma 框架是否仍保持满配。
+ *
+ * - false（周期2）: C, N, O, F — π 键用 p 轨道 → 减少 sigma 方向 → sp²(120°)/sp(180°)
+ * - true（周期3+）: Si, P, S, Cl, ... — π 键用 d 轨道 → sigma 框架不变 → sp³(109.5°)
+ */
+export function hasExpandedOctet(symbol: string): boolean {
+  const elem = ELEMENT_MAP.get(symbol);
+  if (!elem) return false;
+  // 周期1: H(1), He(2) 没有 d 轨道
+  // 周期2: Z=3~10 没有 d 轨道
+  // 周期3+: Z>=11 有 3d 轨道（含过渡金属和主族元素）
+  return elem.atomicNumber > 10;
+}
