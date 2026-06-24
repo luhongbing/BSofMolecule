@@ -6,7 +6,7 @@ echo "=== ci_post_clone.sh: Building web resources ==="
 SCRIPT_DIR="$( cd "$( dirname "$0" )" && pwd )"
 APP_DIR="$( cd "$SCRIPT_DIR/.." && pwd )"
 IOS_DIR="$( cd "$APP_DIR/.." && pwd )"
-WEB_DIR="$( cd "$IOS_DIR/../.." && pwd )"
+WEB_DIR="$( cd "$IOS_DIR/.." && pwd )"
 
 echo "SCRIPT_DIR: $SCRIPT_DIR"
 echo "APP_DIR: $APP_DIR"
