@@ -49,6 +49,7 @@ jobs:
             -scheme App \
             -configuration Debug \
             -sdk iphonesimulator \
+            -derivedDataPath build \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             build
@@ -61,14 +62,19 @@ jobs:
             -scheme App \
             -configuration Release \
             -sdk iphoneos \
+            -derivedDataPath build \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGNING_ALLOWED=NO \
             build
+
+      - name: Find build products
+        working-directory: ./iOS版/ios/App
+        run: find build -name "*.app" -type d 2>/dev/null || echo "No .app found"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ios-build
           path: |
-            iOS版/ios/App/build/**/*.app
+            iOS版/ios/App/build/Build/Products/**/*.app
           retention-days: 7
