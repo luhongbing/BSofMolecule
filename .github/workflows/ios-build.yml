@@ -1,0 +1,73 @@
+name: Build iOS App
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'iOS版/**'
+      - 'Web版/**'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  build-ios:
+    runs-on: macos-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: 'iOS版/package-lock.json'
+
+      - name: Install npm dependencies
+        working-directory: ./iOS版
+        run: npm ci
+
+      - name: Build Web App
+        working-directory: ./iOS版
+        run: npm run build
+
+      - name: Sync to iOS
+        working-directory: ./iOS版
+        run: npx cap sync ios
+
+      - name: Build iOS Project (Simulator)
+        working-directory: ./iOS版/ios/App
+        run: |
+          xcodebuild \
+            -project App.xcodeproj \
+            -scheme App \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'platform=iOS Simulator,name=iPhone 15' \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Build iOS Project (Device, no sign)
+        working-directory: ./iOS版/ios/App
+        run: |
+          xcodebuild \
+            -project App.xcodeproj \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-build
+          path: |
+            iOS版/ios/App/build/**/*.app
+          retention-days: 7
