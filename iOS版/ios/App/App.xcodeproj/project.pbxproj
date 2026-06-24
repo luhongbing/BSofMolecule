@@ -85,6 +85,7 @@
 			buildConfigurationList = 504EC3161FED79650016851F /* Build configuration list for PBXNativeTarget "App" */;
 			buildPhases = (
 				504EC3001FED79650016851F /* Sources */,
+				504EC3211FED79650016851F /* Build Web App */,
 				504EC3011FED79650016851F /* Frameworks */,
 				504EC3021FED79650016851F /* Resources */,
 			);
@@ -164,6 +165,23 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		504EC3211FED79650016851F /* Build Web App */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			name = "Build Web App";
+			outputFileListPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "export NVM_DIR=\"$HOME/.nvm\"\n[ -s \"$NVM_DIR/nvm.sh\" ] && . \"$NVM_DIR/nvm.sh\"\n\nWEB_DIR=\"$SRCROOT/../..\"\n\ncd \"$WEB_DIR\"\n\nif ! command -v npm &> /dev/null; then\n    echo \"npm not found, skipping web build\"\n    exit 0\nfi\n\nif [ ! -d \"node_modules\" ]; then\n    echo \"Installing npm dependencies...\"\n    npm ci || npm install\nfi\n\necho \"Building web app...\"\nnpm run build\n\necho \"Copying to public...\"\nmkdir -p \"$SRCROOT/App/public\"\ncp -r dist/* \"$SRCROOT/App/public/\"\n\necho \"Web build completed.\"";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXVariantGroup section */
 		504EC30B1FED79650016851F /* Main.storyboard */ = {
