@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>MolecularWander.ipa</key>
+	<array>
+		<dict>
+			<key>architectures</key>
+			<array>
+				<string>arm64</string>
+			</array>
+			<key>buildNumber</key>
+			<string>1</string>
+			<key>certificate</key>
+			<dict>
+				<key>SHA1</key>
+				<string>626D704028F2E690E9D66BFFD740F98A6B80E057</string>
+				<key>dateExpires</key>
+				<string>2027/6/24</string>
+				<key>type</key>
+				<string>Cloud Managed Apple Distribution</string>
+			</dict>
+			<key>embeddedBinaries</key>
+			<array>
+				<dict>
+					<key>architectures</key>
+					<array>
+						<string>arm64</string>
+					</array>
+					<key>buildNumber</key>
+					<string>1</string>
+					<key>certificate</key>
+					<dict>
+						<key>SHA1</key>
+						<string>626D704028F2E690E9D66BFFD740F98A6B80E057</string>
+						<key>dateExpires</key>
+						<string>2027/6/24</string>
+						<key>type</key>
+						<string>Cloud Managed Apple Distribution</string>
+					</dict>
+					<key>name</key>
+					<string>Capacitor.framework</string>
+					<key>team</key>
+					<dict>
+						<key>id</key>
+						<string>APWU35386S</string>
+						<key>name</key>
+						<string>Hongbing Lu</string>
+					</dict>
+					<key>versionNumber</key>
+					<string>1.0</string>
+				</dict>
+				<dict>
+					<key>architectures</key>
+					<array>
+						<string>arm64</string>
+					</array>
+					<key>buildNumber</key>
+					<string>1</string>
+					<key>certificate</key>
+					<dict>
+						<key>SHA1</key>
+						<string>626D704028F2E690E9D66BFFD740F98A6B80E057</string>
+						<key>dateExpires</key>
+						<string>2027/6/24</string>
+						<key>type</key>
+						<string>Cloud Managed Apple Distribution</string>
+					</dict>
+					<key>name</key>
+					<string>Cordova.framework</string>
+					<key>team</key>
+					<dict>
+						<key>id</key>
+						<string>APWU35386S</string>
+						<key>name</key>
+						<string>Hongbing Lu</string>
+					</dict>
+					<key>versionNumber</key>
+					<string>1.0</string>
+				</dict>
+			</array>
+			<key>entitlements</key>
+			<dict>
+				<key>application-identifier</key>
+				<string>APWU35386S.com.molecule.molecularwander</string>
+				<key>com.apple.developer.team-identifier</key>
+				<string>APWU35386S</string>
+				<key>get-task-allow</key>
+				<false/>
+			</dict>
+			<key>name</key>
+			<string>MolecularWander.app</string>
+			<key>profile</key>
+			<dict>
+				<key>UUID</key>
+				<string>93994306-0698-432a-b848-36d25868428e</string>
+				<key>dateExpires</key>
+				<string>2027/6/24</string>
+				<key>name</key>
+				<string>iOS Team Ad Hoc Provisioning Profile: com.molecule.molecularwander</string>
+			</dict>
+			<key>team</key>
+			<dict>
+				<key>id</key>
+				<string>APWU35386S</string>
+				<key>name</key>
+				<string>Hongbing Lu</string>
+			</dict>
+			<key>versionNumber</key>
+			<string>1.0.0</string>
+		</dict>
+	</array>
+</dict>
+</plist>

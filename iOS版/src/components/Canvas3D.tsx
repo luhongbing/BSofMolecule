@@ -5617,8 +5617,9 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
     updateMoleculeDisplay();
   }, [state.molecule, state.selectedAtom, state.selectedBond, state.selectedAtoms, showLabels, updateMoleculeDisplay]);
 
+  // 分子变化时只重置万向仪按钮状态，不隐藏
   useEffect(() => {
-    setShowGyroscopeRotation(false);
+    setGyroscopeResetKey(k => k + 1);
   }, [state.molecule]);
 
   // 监听 cameraSpherical 变化并更新相机位置
@@ -5658,7 +5659,6 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
     }
     updateCameraFromSpherical();
     stopRotationAnimation();
-    setShowGyroscopeRotation(false);
     setGyroscopeResetKey(k => k + 1);
   };
 
@@ -5714,7 +5714,6 @@ export function Canvas3D({ toolbarHeight = 76 }: { toolbarHeight?: number }) {
     updateGroupQuaternion();
     updateCameraFromSpherical();
     stopRotationAnimation();
-    setShowGyroscopeRotation(false);
   };
 
   const resetGroupRotation = () => {
