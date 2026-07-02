@@ -10,7 +10,7 @@
 				<string>arm64</string>
 			</array>
 			<key>buildNumber</key>
-			<string>1</string>
+			<string>23</string>
 			<key>certificate</key>
 			<dict>
 				<key>SHA1</key>
@@ -40,6 +40,8 @@
 					</dict>
 					<key>name</key>
 					<string>Capacitor.framework</string>
+					<key>symbols</key>
+					<true/>
 					<key>team</key>
 					<dict>
 						<key>id</key>
@@ -68,6 +70,8 @@
 					</dict>
 					<key>name</key>
 					<string>Cordova.framework</string>
+					<key>symbols</key>
+					<true/>
 					<key>team</key>
 					<dict>
 						<key>id</key>
@@ -83,6 +87,8 @@
 			<dict>
 				<key>application-identifier</key>
 				<string>APWU35386S.com.molecule.molecularwander</string>
+				<key>beta-reports-active</key>
+				<true/>
 				<key>com.apple.developer.team-identifier</key>
 				<string>APWU35386S</string>
 				<key>get-task-allow</key>
@@ -93,12 +99,14 @@
 			<key>profile</key>
 			<dict>
 				<key>UUID</key>
-				<string>93994306-0698-432a-b848-36d25868428e</string>
+				<string>143b77b8-2e02-4bde-b2ee-6e57f7d274ee</string>
 				<key>dateExpires</key>
 				<string>2027/6/24</string>
 				<key>name</key>
-				<string>iOS Team Ad Hoc Provisioning Profile: com.molecule.molecularwander</string>
+				<string>iOS Team Store Provisioning Profile: com.molecule.molecularwander</string>
 			</dict>
+			<key>symbols</key>
+			<true/>
 			<key>team</key>
 			<dict>
 				<key>id</key>

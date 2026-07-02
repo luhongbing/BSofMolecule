@@ -202,7 +202,7 @@ export function Canvas3D() {
 
   const interactionRef = useRef({
     isDragging: false,
-    dragMode: 'rotate' as 'rotate' | 'moveAtom' | 'moveBond' | 'rotateView' | 'moveRef' | 'moveBondEndpoint',
+    dragMode: 'rotate' as 'rotate' | 'moveAtom' | 'moveBond' | 'rotateView' | 'rotateCamera' | 'moveRef' | 'moveBondEndpoint',
     previousPosition: { x: 0, y: 0 },
     draggedAtomId: null as string | null,
     draggedBondId: null as string | null,
@@ -3281,7 +3281,7 @@ export function Canvas3D() {
           interactionRef.current.insertAtomPosition = { x: localIntersection.x, y: localIntersection.y, z: localIntersection.z };
         }
         interactionRef.current.isDragging = true;
-        interactionRef.current.dragMode = 'rotateView';
+        interactionRef.current.dragMode = (e.button === 2 || e.altKey) ? 'rotateCamera' : 'rotateView';
         return;
       }
 
@@ -3308,7 +3308,7 @@ export function Canvas3D() {
           interactionRef.current.insertFunctionalGroupPosition = { x: localIntersection.x, y: localIntersection.y, z: localIntersection.z };
         }
         interactionRef.current.isDragging = true;
-        interactionRef.current.dragMode = 'rotateView';
+        interactionRef.current.dragMode = (e.button === 2 || e.altKey) ? 'rotateCamera' : 'rotateView';
         return;
       }
 
@@ -3336,7 +3336,7 @@ export function Canvas3D() {
           interactionRef.current.insertBondPosition = { x: localIntersection.x, y: localIntersection.y, z: localIntersection.z };
         }
         interactionRef.current.isDragging = true;
-        interactionRef.current.dragMode = 'rotateView';
+        interactionRef.current.dragMode = (e.button === 2 || e.altKey) ? 'rotateCamera' : 'rotateView';
         return;
       }
 
@@ -3549,7 +3549,7 @@ export function Canvas3D() {
         setGyroSelectedAtomId(null);
         updateSelectedAtomsRef.current([]);
         selectBondRef.current(null);
-        interactionRef.current.dragMode = 'rotateView';
+        interactionRef.current.dragMode = (e.button === 2 || e.altKey) ? 'rotateCamera' : 'rotateView';
         interactionRef.current.startSpherical = {
           theta: cameraSpherical.theta,
           phi: cameraSpherical.phi,
@@ -3872,11 +3872,15 @@ export function Canvas3D() {
           selectBondRef.current(null);
           updateSelectedAtomsRef.current([]);
 
-          interactionRef.current.dragMode = 'rotateView';
-          interactionRef.current.startSpherical = {
-            theta: cameraSpherical.theta,
-            phi: cameraSpherical.phi,
-          };
+          if (e.button === 2 || e.altKey) {
+            interactionRef.current.dragMode = 'rotateCamera';
+          } else {
+            interactionRef.current.dragMode = 'rotateView';
+            interactionRef.current.startSpherical = {
+              theta: cameraSpherical.theta,
+              phi: cameraSpherical.phi,
+            };
+          }
           interactionRef.current.isDragging = true;
         }
       }
@@ -3967,6 +3971,8 @@ export function Canvas3D() {
           // moleculeRotation = viewQuat.inverse() * group.quaternion
           moleculeRotationRef.current.copy(viewQuaternionRef.current.clone().invert().multiply(groupRef.current.quaternion));
         }
+      } else if (interactionRef.current.dragMode === 'rotateCamera') {
+        rotateViewByDelta(-deltaX, -deltaY, 0.008);
       } else if (interactionRef.current.dragMode === 'moveAtom' && interactionRef.current.draggedAtomId) {
         // 确保 matrixWorld 是最新的
         groupRef.current!.updateMatrixWorld();
@@ -5430,6 +5436,26 @@ export function Canvas3D() {
       }
     };
 
+    const rotateViewByDelta = (deltaX: number, deltaY: number, sensitivity: number) => {
+      if (!cameraRef.current || !groupRef.current) return;
+      
+      const quatY = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -deltaX * sensitivity);
+      const quatX = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -deltaY * sensitivity);
+      
+      const viewOld = viewQuaternionRef.current.clone();
+      
+      viewQuaternionRef.current.premultiply(quatY);
+      viewQuaternionRef.current.premultiply(quatX);
+      
+      const quatYInv = quatY.clone().invert();
+      const quatYInv2 = quatYInv.clone().multiply(quatYInv);
+      const compensation = viewOld.clone().invert().multiply(quatYInv2).multiply(viewOld);
+      moleculeRotationRef.current.copy(compensation.multiply(moleculeRotationRef.current.clone()));
+      
+      syncViewToSpherical();
+      updateGroupQuaternion();
+    };
+
     // 添加 wheel 事件支持 - 用于笔记本电脑触摸板双指滑动
     const onWheel = (e: WheelEvent) => {
       e.preventDefault();
@@ -5437,45 +5463,21 @@ export function Canvas3D() {
       if (e.ctrlKey || interactionRef.current.isDragging) return;
       
       if (cameraRef.current && groupRef.current) {
-        // 限制 delta 值，防止跳变
         const clampedDeltaX = Math.max(-50, Math.min(50, e.deltaX));
         const clampedDeltaY = Math.max(-50, Math.min(50, e.deltaY));
         
-        const sensitivity = 0.003;
-        
-        // 双指滑动调整视角方向
-        // 原则3：右滑→南→东，下滑→南→上
-        // 用世界空间的固定轴旋转：rotY(0,1,0) 绕世界Y轴，rotX(1,0,0) 绕世界X轴
-        const quatY = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), -clampedDeltaX * sensitivity);
-        const quatX = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), -clampedDeltaY * sensitivity);
-        
-        // 保存旧的viewQuat用于补偿计算
-        const viewOld = viewQuaternionRef.current.clone();
-        
-        // 应用旋转到viewQuaternion
-        viewQuaternionRef.current.premultiply(quatY);
-        viewQuaternionRef.current.premultiply(quatX);
-        
-        // 原则7：分子旋转方向与双指滑动方向相反
-        // 视觉旋转 = group.new / group.old = quatX * quatY
-        // 期望视觉旋转 = quatX * quatY.invert()（水平反向，垂直不变）
-        // 推导：moleculeRotation.new = viewOld.invert() * quatYInv² * viewOld * moleculeRotation.old
-        // 共轭变换确保补偿在分子本地空间正确，不受当前视角影响
-        const quatYInv = quatY.clone().invert();
-        const quatYInv2 = quatYInv.clone().multiply(quatYInv);
-        const compensation = viewOld.clone().invert().multiply(quatYInv2).multiply(viewOld);
-        moleculeRotationRef.current.copy(compensation.multiply(moleculeRotationRef.current.clone()));
-        
-        // 同步到cameraSpherical供万向仪显示
-        syncViewToSpherical();
-        
-        updateGroupQuaternion();
+        rotateViewByDelta(clampedDeltaX, clampedDeltaY, 0.003);
       }
     };
 
     renderer.domElement.addEventListener('mousedown', onMouseDown);
     window.addEventListener('mousemove', onMouseMove);
     window.addEventListener('mouseup', onMouseUp);
+
+    const onContextMenu = (e: MouseEvent) => {
+      e.preventDefault();
+    };
+    renderer.domElement.addEventListener('contextmenu', onContextMenu);
 
     renderer.domElement.addEventListener('touchstart', onTouchStart, { passive: false });
     renderer.domElement.addEventListener('touchmove', onTouchMove, { passive: false });
@@ -5539,6 +5541,8 @@ export function Canvas3D() {
       renderer.domElement.removeEventListener('mousedown', onMouseDown);
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
+
+      renderer.domElement.removeEventListener('contextmenu', onContextMenu);
 
       renderer.domElement.removeEventListener('touchstart', onTouchStart);
       renderer.domElement.removeEventListener('touchmove', onTouchMove);
@@ -5669,7 +5673,7 @@ export function Canvas3D() {
 
   const getCursor = () => {
     if (interactionRef.current.isDragging) {
-      if (interactionRef.current.dragMode === 'rotateView') return 'grabbing';
+      if (interactionRef.current.dragMode === 'rotateView' || interactionRef.current.dragMode === 'rotateCamera') return 'grabbing';
       if (interactionRef.current.dragMode === 'moveAtom' || interactionRef.current.dragMode === 'moveBond') return 'move';
     }
     if (hoveredObject) return 'pointer';
